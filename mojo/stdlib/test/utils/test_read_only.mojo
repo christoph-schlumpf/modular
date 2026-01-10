@@ -32,6 +32,17 @@ def test_readonly_type_default_usage():
     )
 
 
+def test_readonly_type_movable():
+    var ro_val = Readonly("Hallo")
+    var ro_val_moved = ro_val^
+
+    assert_equal(
+        ro_val_moved[],
+        "Hallo",
+        msg="failed to use compile-time read-only ro_val",
+    )
+
+
 def test_readonly_type_immutable():
     var runtime_value = get_runtime_value()
     ref ro_ref = Readonly(runtime_value)[]
