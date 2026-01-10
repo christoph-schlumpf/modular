@@ -31,6 +31,7 @@ from max.interfaces import (
     MAXPushQueue,
     RequestID,
     SchedulerResult,
+    TokenBuffer,
 )
 from max.kv_cache import PagedKVCacheManager
 from max.nn.kv_cache import KVCacheParams, KVCacheStrategy
@@ -64,7 +65,7 @@ def create_text_context(
     return TTSContext(
         request_id=RequestID(),
         max_length=max_seq_len,
-        tokens=tokens,
+        tokens=TokenBuffer(tokens),
         streaming=False,
     )
 
@@ -187,7 +188,9 @@ class FakeAudioGeneratorPipeline(AudioGeneratorPipelineType):
     def execute(
         self, inputs: AudioGenerationInputs[TTSContext]
     ) -> dict[RequestID, AudioGenerationOutput]:
-        needs_ce = next(iter(inputs.batch.values())).needs_ce
+        needs_ce = (
+            next(iter(inputs.batch.values())).tokens.generated_length == 0
+        )
 
         if needs_ce:
             num_tokens = 1
@@ -219,7 +222,7 @@ class FakeAudioGeneratorPipeline(AudioGeneratorPipelineType):
             for _ in range(num_tokens):
                 context.update(new_token=rand(1)[0])
 
-                if context.current_length == context.max_length:
+                if len(context.tokens) == context.max_length:
                     resp = AudioGenerationOutput(
                         GenerationStatus.MAXIMUM_LENGTH,
                         steps_executed=num_tokens,
@@ -342,7 +345,7 @@ def enqueue_request(
         max_seq_len=max_seq_len,
         shared_prefix=shared_prefix,
     )
-    assert context.active_length == prompt_len
+    assert context.tokens.active_length == prompt_len
     queue.put_nowait(context)
 
 
@@ -354,7 +357,7 @@ def enqueue_request_with_prompt(
     context = TTSContext(
         request_id=RequestID(),
         max_length=max_seq_len,
-        tokens=tokens,
+        tokens=TokenBuffer(tokens),
         streaming=False,
     )
 

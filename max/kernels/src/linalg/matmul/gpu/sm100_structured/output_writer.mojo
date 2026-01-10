@@ -48,9 +48,9 @@ from .tile_writer import (
     TMAStoreCoords,
     TMAStoreExecutor,
     TMEMToSMemWriter,
-    load_tmem_fragments,
     tma_wait_pipelined,
 )
+from .tmem import TmemArrayType
 
 
 @register_passable("trivial")
@@ -143,6 +143,15 @@ struct TileWriter[
         Self.cg2_num_stages if Self.cta_group == 2 else Self.cg1_num_stages
     )
 
+    # TMEM array type for accumulator tiles
+    comptime accum_tile_layout = Layout.row_major(Self.BM, Self.stageN)
+    comptime AccumTmemArray = TmemArrayType[
+        Self.accum_type,
+        Self.accum_tile_layout,
+        Self.num_stages,
+        cta_group = Self.cta_group,
+    ]
+
     var c_tma_op: Self.TmaOpPtr
 
     @always_inline
@@ -183,7 +192,7 @@ struct TileWriter[
         # Perform reduction and check if this is the last split
         var is_last_split = scheduler.reduction(
             reduction_tensor,
-            stage.tmem.offset(),
+            stage.tmem.address(),
             epilogue_thread_idx,
             work_info,
         )
@@ -204,7 +213,7 @@ struct TileWriter[
         c_shape: Tuple[UInt32, UInt32],
     ):
         """TMEM → Registers → SMEM → GMEM pipeline."""
-        var tmem_offset = output_stage.tmem.offset()
+        var accum_tiles = Self.AccumTmemArray(output_stage.tmem.offset())
 
         comptime simd_size = simd_width_of[Self.c_type]()
         var warp_id = get_warp_id()
@@ -224,7 +233,7 @@ struct TileWriter[
             Self.c_swizzle,
             Self.transpose_c,
         ]
-        var smem_writer = SMEMWriter(warp_id, lane)
+        var smem_writer = SMEMWriter(UInt32(warp_id), UInt32(lane))
 
         comptime StoreExecutor = TMAStoreExecutor[
             Self.c_type,
@@ -249,26 +258,24 @@ struct TileWriter[
             Self.cta_group,
             Self.transpose_c,
         ]
-        var epilogue_applier = EpilogueApplierType(warp_id, lane)
-        var c_row = c_coord[0] * UInt(Self.BM)
-        var c_col = c_coord[1] * UInt(Self.MMA_N)
+        var epilogue_applier = EpilogueApplierType(
+            UInt32(warp_id), UInt32(lane)
+        )
+        var c_row = UInt32(c_coord[0] * UInt(Self.BM))
+        var c_col = UInt32(c_coord[1] * UInt(Self.MMA_N))
 
         var upper_frag_casted: SIMD[Self.epilogue_dtype, Self.rep_frag_size]
         var lower_frag_casted: SIMD[Self.epilogue_dtype, Self.rep_frag_size]
 
         @parameter
         for stage in range(Self.num_stages):
-            var stage_tmem_addr = tmem_offset + (stage * Self.stageN)
-
-            upper_frag_casted, lower_frag_casted = load_tmem_fragments[
-                Self.accum_type,
-                Self.epilogue_dtype,
-                Self.fragment_size,
-                Self.is_lower_frag_required,
-                Self.data_paths,
-                Self.bits,
-                Self.rep,
-            ](stage_tmem_addr)
+            # Load fragments from TMEM tile - is_lower_required handled internally
+            var frags = accum_tiles[stage].load_fragments[Self.rep]()
+            Self.AccumTmemArray.Tile.wait_load()
+            var casted = frags.cast[Self.epilogue_dtype]()
+            # rebind bridges TmemTensor's (4 * rep) to our (rep * 4) type
+            upper_frag_casted = rebind[type_of(upper_frag_casted)](casted.upper)
+            lower_frag_casted = rebind[type_of(lower_frag_casted)](casted.lower)
 
             @parameter
             if stage == Self.num_stages - 1:
@@ -335,7 +342,7 @@ struct TileWriter[
                     stage,
                     Self.rep_frag_size,
                     Self.elementwise_compute_lambda_fn.value(),
-                ](warp_id, c_tiles, c_shape, c_coord)
+                ](UInt32(warp_id), c_tiles, c_shape, c_coord)
                 writer.write_tile(
                     AccumTile(upper_frag_casted, lower_frag_casted)
                 )
@@ -350,9 +357,13 @@ struct TileWriter[
                 Self.c_smem_layout.shape[0].value(),
                 stage,
             ]
-            var store_coords = StoreCoords(c_coord, warp_id)
+            var store_coords = StoreCoords(c_coord, UInt32(warp_id))
             StoreExecutor.execute[Self.c_layout, Self.c_desc_layout](
-                c_smem_tile, store_coords, self.c_tma_op[], warp_id, lane
+                c_smem_tile,
+                store_coords,
+                self.c_tma_op[],
+                UInt32(warp_id),
+                UInt32(lane),
             )
             tma_wait_pipelined[
                 Self.c_type,

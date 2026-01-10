@@ -27,6 +27,7 @@ from max.interfaces import (
     ImageMetadata,
     TextGenerationRequest,
     TextGenerationRequestMessage,
+    TokenBuffer,
 )
 from max.pipelines.core import TextAndVisionContext
 from max.pipelines.lib import TextAndVisionTokenizer
@@ -84,15 +85,15 @@ class Idefics3Tokenizer(TextAndVisionTokenizer):
         )
 
         self.enable_prefix_caching = (
-            pipeline_config.model_config.kv_cache_config.enable_prefix_caching
-            if pipeline_config
+            pipeline_config.model.kv_cache_config.enable_prefix_caching
+            if pipeline_config is not None
             else False
         )
 
         if vision_token_id := getattr(config, "image_token_id", None):
             self.vision_token_ids = [vision_token_id]
         else:
-            raise ValueError("image_token_id not found in model_config config")
+            raise ValueError("image_token_id not found in model config")
 
         self.processor = AutoProcessor.from_pretrained(
             model_path, revision=revision
@@ -276,11 +277,16 @@ class Idefics3Tokenizer(TextAndVisionTokenizer):
             raise ValueError(
                 f"Number of image token indices ({len(start_and_end_idxs)}) does not match number of pixel values ({len(pixel_values)})"
             )
+
+        token_buffer = TokenBuffer(
+            array=encoded_prompt.astype(np.int64, copy=False),
+        )
+
         context = TextAndVisionContext(
             request_id=request.request_id,
             eos_token_ids=eos_token_ids,
             extra_model_args=extra_model_args,
-            tokens=encoded_prompt,
+            tokens=token_buffer,
             max_length=encoded_prompt.shape[0] + max_gen_tokens
             if max_gen_tokens is not None
             else self.max_length,

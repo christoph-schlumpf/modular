@@ -218,17 +218,21 @@ class EAGLESpeculativeDecodingPipeline(SpeculativeDecodingPipelineBase):
         Returns:
             Tuple of (ModelInputs for draft model, num_steps)
         """
-        start_indices = [context._start_idx for context in batch]
+        start_indices = [context.tokens.processed_length for context in batch]
 
         # kv cache needs to fetch starting from 0
         for context in batch:
             if needs_ce:
                 self._draft_kv_start_idx[context.request_id] = 0
-                context._start_idx = 0
+                context.tokens.rewind_processing(
+                    context.tokens.processed_length
+                )
             else:
-                context._start_idx = self._draft_kv_start_idx[
-                    context.request_id
-                ]
+                delta = (
+                    self._draft_kv_start_idx[context.request_id]
+                    - context.tokens.processed_length
+                )
+                context.tokens.skip_processing(delta)
 
         for ctx in batch:
             model.kv_manager.alloc(ctx, num_steps=num_steps)
@@ -237,9 +241,13 @@ class EAGLESpeculativeDecodingPipeline(SpeculativeDecodingPipelineBase):
         for i, context in enumerate(batch):
             if needs_ce:
                 # Skip the first token in CE
-                context._start_idx = 1
+                context.tokens.skip_processing(1)
             else:
-                context._start_idx = start_indices[i]
+                delta = start_indices[i] - context.tokens.processed_length
+                if delta > 0:
+                    context.tokens.skip_processing(delta)
+                else:
+                    context.tokens.rewind_processing(-delta)
 
         base_inputs = model.prepare_initial_token_inputs(
             replica_batches=[batch],
@@ -253,9 +261,13 @@ class EAGLESpeculativeDecodingPipeline(SpeculativeDecodingPipelineBase):
 
         for i, context in enumerate(batch):
             self._draft_kv_start_idx[context.request_id] += (
-                context.active_length
+                context.tokens.active_length
             )
-            context._start_idx = start_indices[i]
+            delta = start_indices[i] - context.tokens.processed_length
+            if delta > 0:
+                context.tokens.skip_processing(delta)
+            else:
+                context.tokens.rewind_processing(-delta)
             context.apply_processing_offset(0)
 
         return (base_inputs, num_steps)
@@ -693,7 +705,7 @@ class EAGLESpeculativeDecodingPipeline(SpeculativeDecodingPipelineBase):
         """
         context_batch = list(inputs.batch.values())
 
-        needs_ce = context_batch[0].needs_ce
+        needs_ce = context_batch[0].tokens.generated_length == 0
         if needs_ce:
             target_outputs, target_sampled_tokens = self._target_extend(inputs)
             assert target_outputs.hidden_states is not None
