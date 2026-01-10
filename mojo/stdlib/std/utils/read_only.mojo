@@ -14,7 +14,7 @@
 
 from memory import OwnedPointer
 from builtin.constrained import _constrained_conforms_to
-from builtin.rebind import trait_downcast, downcast
+from builtin.rebind import downcast
 
 
 struct Readonly[T: Movable](Copyable, ImplicitlyDestructible):
