@@ -13,17 +13,17 @@
 
 from testing import TestSuite, assert_equal
 from test_utils import ExplicitDelOnly, MoveOnly
-from utils import Readonly
+from utils import Readonly, readonly
 
 
 fn get_runtime_value() -> String:
-    # simulate a function that returns a runtime value
+    """Simulate a function that returns a runtime value."""
     return "user input"
 
 
-def test_read_only_default_usage():
+def test_readonly_type_default_usage():
     ref ro_ref = Readonly(get_runtime_value())[]
-    # value = ""  # compile-time error
+    # ro_ref = ""  # compile-time error
 
     assert_equal(
         ro_ref,
@@ -32,7 +32,7 @@ def test_read_only_default_usage():
     )
 
 
-def test_read_only_immutable():
+def test_readonly_type_immutable():
     var runtime_value = get_runtime_value()
     ref ro_ref = Readonly(runtime_value)[]
     runtime_value = ""  # does not affect ro_ref
@@ -49,7 +49,7 @@ def test_read_only_immutable():
     )
 
 
-def test_read_only_MoveOnly():
+def test_readonly_type_MoveOnly():
     var ro_val = Readonly(MoveOnly(get_runtime_value()))
     var ro_val_moved = ro_val^
 
@@ -60,13 +60,27 @@ def test_read_only_MoveOnly():
     )
 
 
-def test_read_only_copy():
+def test_readonly_type_copy():
     var ro_val = Readonly("Hallo")
     var ro_val_copy = ro_val.copy()  # test Copyable conformance
     assert_equal(ro_val_copy[], "Hallo", msg="failed to copy Readonly value")
 
 
-def test_read_only_explicit_del():
+def test_readonly_type_in_list():
+    var list_with_ro = [Readonly(1), Readonly(2), Readonly(3)]
+    list_with_ro.append(Readonly(4))  # OK Append a readonly value to the list
+    list_with_ro[2] = Readonly(10)  # OK Replace a readonly value in the list
+    # list_with_ro[2] += 1 # compile-time error
+
+    list_with_ro_2 = list_with_ro.copy()
+    assert_equal(
+        len(list_with_ro_2),
+        4,
+        msg="failed to use runtime read-only ro_ref for list",
+    )
+
+
+def test_readonly_type_explicit_del():
     var runtime_value = Readonly(ExplicitDelOnly(1))
     ref ro_ref = runtime_value[]
 
@@ -78,6 +92,16 @@ def test_read_only_explicit_del():
         )
     finally:
         runtime_value^.destroy_with(ExplicitDelOnly.destroy)
+
+
+def test_readonly_function():
+    ref ro_ref = readonly(get_runtime_value())
+    # ro_ref = ""  # compile-time error
+    assert_equal(
+        ro_ref,
+        "user input",
+        msg="failed to use runtime read-only ro_ref from readonly function",
+    )
 
 
 def main():
