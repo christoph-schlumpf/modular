@@ -162,9 +162,9 @@ class ChatCompletionRequestSystemMessage(BaseModel):
 
 
 class ChatCompletionRequestUserMessage(BaseModel):
-    content: Union[str, List[ChatCompletionRequestUserMessageContentPart]] = (
-        Field(..., description='The contents of the user message.\n')
-    )
+    content: Optional[
+        Union[str, List[ChatCompletionRequestUserMessageContentPart]]
+    ] = Field(None, description='The contents of the user message.\n')
     role: Literal['user'] = Field(
         ..., description='The role of the messages author, in this case `user`.'
     )
@@ -448,6 +448,13 @@ class Choice3(BaseModel):
     )
 
 
+class PromptTokensDetails(BaseModel):
+    cached_tokens: int = Field(
+        default=0,
+        description='Number of prompt tokens served from the KV prefix cache.',
+    )
+
+
 class Usage(BaseModel):
     completion_tokens: int = Field(
         ..., description='Number of tokens in the generated completion.'
@@ -458,6 +465,10 @@ class Usage(BaseModel):
     total_tokens: int = Field(
         ...,
         description='Total number of tokens used in the request (prompt + completion).',
+    )
+    prompt_tokens_details: Optional[PromptTokensDetails] = Field(
+        default=None,
+        description='Breakdown of tokens used in the prompt.',
     )
 
 
@@ -1354,6 +1365,10 @@ class CompletionUsage(BaseModel):
     total_tokens: int = Field(
         ...,
         description='Total number of tokens used in the request (prompt + completion).',
+    )
+    prompt_tokens_details: Optional[PromptTokensDetails] = Field(
+        default=None,
+        description='Breakdown of tokens used in the prompt.',
     )
 
 
@@ -3470,6 +3485,10 @@ class CreateCompletionRequest(BaseModel):
         description='What sampling temperature to use, between 0 and 2. Higher values like 0.8 will make the output more random, while lower values like 0.2 will make it more focused and deterministic.\n\nWe generally recommend altering this or `top_p` but not both.\n',
         examples=[1],
     )
+    thinking_temperature: Optional[Annotated[float, Field(ge=0.0, le=2.0)]] = Field(
+        None,
+        description='Temperature override applied while generating tokens inside a `<think>...</think>` block. Only takes effect when the deployment is configured with a reasoning parser; ignored otherwise.\n',
+    )
     top_k: Optional[Annotated[int, Field(ge=-1, le=255)]] = Field(
         None,
         description='Integer that controls the number of top tokens to consider.\n',
@@ -4917,6 +4936,10 @@ class CreateChatCompletionRequest(BaseModel):
         None,
         description='What sampling temperature to use, between 0 and 2. Higher values like 0.8 will make the output more random, while lower values like 0.2 will make it more focused and deterministic.\n\nWe generally recommend altering this or `top_p` but not both.\n',
         examples=[1],
+    )
+    thinking_temperature: Optional[Annotated[float, Field(ge=0.0, le=2.0)]] = Field(
+        None,
+        description='Temperature override applied while generating tokens inside a `<think>...</think>` block. Only takes effect when the deployment is configured with a reasoning parser; ignored otherwise.\n',
     )
     top_k: Optional[Annotated[int, Field(ge=-1, le=255)]] = Field(
         None,

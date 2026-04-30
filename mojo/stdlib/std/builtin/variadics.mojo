@@ -1221,8 +1221,7 @@ struct VariadicList[
                 Int(0)._int_mlir_index(),
             )
         ).bitcast[Self._EltPointerType]()
-        var size_tmp = size  # FIXME: Weird MLIR syntax error?
-        self._value = Span(ptr=elt_ptr, length=Int(mlir_value=size_tmp))
+        self._value = Span(ptr=elt_ptr, length=Int(mlir_value=size))
 
     # The destructor for this type is trivial if not an "owned" list.
     comptime __del__is_trivial: Bool = not Self.is_owned
@@ -1504,19 +1503,13 @@ struct VariadicPack[
 
         comptime if Self.is_owned:
             comptime for i in reversed(range(Self.__len__())):
-                # FIXME(MOCO-2953):
-                #   Due to a compiler limitation, we can't use
-                #   conforms_to() here, meaning the `trait_downcast` below
-                #   could fail with a worse elaboration error than we'd get from
-                #   _constrained_conforms_to.
-                #
-                # comptime element_type = Self.element_types[i]
-                # _constrained_conforms_to[
-                #     conforms_to(element_type, ImplicitlyDestructible),
-                #     Parent=Self,
-                #     Element=element_type,
-                #     ParentConformsTo="ImplicitlyDestructible",
-                # ]()
+                comptime element_type = Self.element_types[i]
+                _constrained_conforms_to[
+                    conforms_to(element_type, ImplicitlyDestructible),
+                    Parent=Self,
+                    Element=element_type,
+                    ParentConformsTo="ImplicitlyDestructible",
+                ]()
 
                 # Safety: We own the elements in this pack.
                 UnsafePointer(
@@ -1608,19 +1601,21 @@ struct VariadicPack[
         `, 0: index>: `,
         _MLIR.KGENParamListType[__mlir_type.`!kgen.type`],
     ]
-    """Use variadic_ptr_map to construct the type list of the !kgen.pack that
+    """Use variadic_ptr_map to construct the type list of the !kgen.struct that
     the !lit.ref.pack will lower to.  It exposes the pointers introduced by the
     references.
     """
     comptime _kgen_pack_with_pointer_type = __mlir_type[
-        `!kgen.pack<:param_list<type> `, Self._variadic_pointer_types, `>`
+        `!kgen.struct<:param_list<type> `,
+        Self._variadic_pointer_types,
+        ` isParamPack>`,
     ]
-    """This is the !kgen.pack type with pointer elements."""
+    """This is the !kgen.struct type with pointer elements."""
 
     @doc_hidden
     @always_inline("nodebug")
     def get_as_kgen_pack(self) -> Self._kgen_pack_with_pointer_type:
-        """This rebinds `in_pack` to the equivalent `!kgen.pack` with kgen
+        """This rebinds `in_pack` to the equivalent `!kgen.struct` with kgen
         pointers."""
         return rebind[Self._kgen_pack_with_pointer_type](self._value)
 
@@ -1632,11 +1627,11 @@ struct VariadicPack[
         _MLIR.KGENParamListType[__mlir_type.`!kgen.type`],
     ]
     comptime _loaded_kgen_pack_type = __mlir_type[
-        `!kgen.pack<:param_list<type> `,
+        `!kgen.struct<:param_list<type> `,
         Self._variadic_with_pointers_removed,
-        `>`,
+        ` isParamPack>`,
     ]
-    """This is the `!kgen.pack` type that happens if one loads all the elements
+    """This is the `!kgen.struct` type that happens if one loads all the elements
     of the pack.
     """
 
@@ -1647,7 +1642,7 @@ struct VariadicPack[
     def get_loaded_kgen_pack(self) -> Self._loaded_kgen_pack_type:
         """This returns the stored KGEN pack after loading all of the elements.
         """
-        return __mlir_op.`kgen.pack.load`(self.get_as_kgen_pack())
+        return __mlir_op.`kgen.struct.load_indirect`(self.get_as_kgen_pack())
 
     def _write_to[
         O1: ImmutOrigin,

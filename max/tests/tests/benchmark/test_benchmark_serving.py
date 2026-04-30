@@ -23,13 +23,17 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import numpy as np
 import pytest
 from max.benchmark.benchmark_serving import (
-    _add_spec_decode_result,
+    _compute_steady_state_result,
     _ConcurrentTurnsRequestDriver,
+    _log_warmup_sampling_report,
+    _pick_warmup_population,
+    _WarmupSamplingReport,
     chat_session_driver,
     elide_data_uris_in_string,
     get_request,
     parse_args,
     prime_prefix_turns,
+    systematic_probability_proportional_to_size,
 )
 from max.benchmark.benchmark_shared.datasets import SampledRequest
 from max.benchmark.benchmark_shared.datasets.types import (
@@ -43,7 +47,6 @@ from max.benchmark.benchmark_shared.metrics import (
     StandardPercentileMetrics,
     ThroughputMetrics,
     calculate_spec_decode_stats,
-    parse_spec_decode_metrics,
 )
 from max.benchmark.benchmark_shared.request import (
     BaseRequestFuncInput,
@@ -51,6 +54,9 @@ from max.benchmark.benchmark_shared.request import (
     RequestDriver,
     RequestFuncInput,
     RequestFuncOutput,
+)
+from max.benchmark.benchmark_shared.server_metrics import (
+    parse_spec_decode_metrics,
 )
 
 
@@ -1118,9 +1124,8 @@ def test_calculate_spec_decode_stats_matches_vllm_math() -> None:
     )
 
 
-def test_add_spec_decode_result_uses_vllm_json_keys() -> None:
+def test_spec_decode_stats_to_result_dict_uses_vllm_json_keys() -> None:
     """Spec decode stats are serialized under vLLM-compatible keys."""
-    result: dict[str, object] = {}
     stats = SpecDecodeStats(
         num_drafts=5,
         draft_tokens=18,
@@ -1130,15 +1135,64 @@ def test_add_spec_decode_result_uses_vllm_json_keys() -> None:
         per_position_acceptance_rates=[1.0, 0.6, 0.2],
     )
 
-    _add_spec_decode_result(result, stats)
-
-    assert result == {
+    assert stats.to_result_dict() == {
         "spec_decode_acceptance_rate": 50.0,
         "spec_decode_acceptance_length": 2.8,
         "spec_decode_num_drafts": 5,
         "spec_decode_draft_tokens": 18,
         "spec_decode_accepted_tokens": 9,
         "spec_decode_per_position_acceptance_rates": [1.0, 0.6, 0.2],
+    }
+
+
+def test_parse_spec_decode_metrics_handles_maxserve_histogram() -> None:
+    """MAX Serve's per-position acceptance histogram is parsed into running sums/counts."""
+    metrics_text = """# HELP maxserve_spec_decode_acceptance_rate_per_position Per-position acceptance.
+# TYPE maxserve_spec_decode_acceptance_rate_per_position histogram
+maxserve_spec_decode_acceptance_rate_per_position_sum{position="0"} 8400.0
+maxserve_spec_decode_acceptance_rate_per_position_count{position="0"} 100
+maxserve_spec_decode_acceptance_rate_per_position_sum{position="1"} 5000.0
+maxserve_spec_decode_acceptance_rate_per_position_count{position="1"} 100
+"""
+
+    parsed = parse_spec_decode_metrics(metrics_text)
+
+    assert parsed is not None
+    assert parsed.num_drafts == 0
+    assert parsed.num_draft_tokens == 0
+    assert parsed.per_pos_rate_sum == {0: 8400.0, 1: 5000.0}
+    assert parsed.per_pos_rate_count == {0: 100, 1: 100}
+
+
+def test_calculate_spec_decode_stats_from_maxserve_histogram_only() -> None:
+    """Without aggregate counters, per-position rates still surface from histogram deltas."""
+    before = SpecDecodeMetrics(
+        per_pos_rate_sum={0: 8000.0, 1: 4000.0},
+        per_pos_rate_count={0: 100, 1: 100},
+    )
+    after = SpecDecodeMetrics(
+        per_pos_rate_sum={0: 16800.0, 1: 9000.0},
+        per_pos_rate_count={0: 200, 1: 200},
+    )
+
+    stats = calculate_spec_decode_stats(before, after)
+
+    assert stats is not None
+    # Window per-position acceptance: (8800/100)% / 100 = 0.88; (5000/100)% / 100 = 0.50
+    assert stats.per_position_acceptance_rates == pytest.approx([0.88, 0.50])
+    assert stats.num_drafts is None
+    assert stats.draft_tokens is None
+    assert stats.accepted_tokens is None
+    assert stats.acceptance_rate is None
+    assert stats.acceptance_length is None
+
+
+def test_spec_decode_stats_to_result_dict_omits_missing_aggregates() -> None:
+    """JSON result only includes fields the backend actually exposed."""
+    stats = SpecDecodeStats(per_position_acceptance_rates=[0.88, 0.50])
+
+    assert stats.to_result_dict() == {
+        "spec_decode_per_position_acceptance_rates": [0.88, 0.50],
     }
 
 
@@ -1164,3 +1218,423 @@ def test_concurrent_turns_driver_expired_deadline_cancels_without_calling_base()
 
     assert output_cls.call_args.kwargs["cancelled"] is True
     mock_driver.request.assert_not_called()
+
+
+def _make_tokenizer_mock(tokens_per_output: int = 5) -> MagicMock:
+    """Return a tokenizer mock whose encode call returns a fixed token count."""
+    tokenizer = MagicMock()
+    tokenizer.return_value = MagicMock(input_ids=list(range(tokens_per_output)))
+    return tokenizer
+
+
+def _make_request_func_output(
+    *,
+    prompt_len: int = 10,
+    generated_text: str = "hello world",
+    latency: float = 1.0,
+    ttft: float = 0.1,
+    itl: list[float] | None = None,
+    request_submit_time: float | None = 0.0,
+) -> RequestFuncOutput:
+    return RequestFuncOutput(
+        success=True,
+        latency=latency,
+        ttft=ttft,
+        prompt_len=prompt_len,
+        generated_text=generated_text,
+        itl=itl or [],
+        request_submit_time=request_submit_time,
+    )
+
+
+def test_compute_steady_state_result_not_detected() -> None:
+    """With too few requests, _compute_steady_state_result returns only detection-metadata keys."""
+    outputs = [_make_request_func_output() for _ in range(3)]
+    result = _compute_steady_state_result(
+        outputs=outputs,
+        tokenizer=None,
+        gpu_metrics=None,
+        cpu_metrics=None,
+        max_concurrency=None,
+        max_concurrent_conversations=None,
+        collect_gpu_stats=False,
+        metrics_by_endpoint=None,
+    ).to_result_dict()
+
+    assert result == {
+        "steady_state_detected": False,
+        "steady_state_start_index": None,
+        "steady_state_end_index": None,
+        "steady_state_count": 0,
+        "steady_state_warning": (
+            "Too few valid requests (3 of 3 total) for steady-state"
+            " detection (need at least 100). TPOT was absent across the"
+            " run, so detection ran in TTFT-only mode; the run has too few"
+            " valid requests (cancelled, failed, or missing"
+            " timestamps/TTFT are filtered out)."
+        ),
+        "steady_state_mode": "ttft_only",
+    }
+
+
+def _make_stable_request_func_output(submit_time: float) -> RequestFuncOutput:
+    """Return a RequestFuncOutput with stable TTFT and TPOT suitable for steady-state detection."""
+    tpot = [0.02, 0.02, 0.02]
+    return RequestFuncOutput(
+        success=True,
+        latency=1.0,
+        ttft=0.05,
+        prompt_len=10,
+        generated_text="hello world",
+        itl=tpot,
+        tpot=tpot,
+        request_submit_time=submit_time,
+    )
+
+
+def test_compute_steady_state_result_detected() -> None:
+    """With enough stable requests, _compute_steady_state_result detects steady state and returns metric keys."""
+    outputs = [_make_stable_request_func_output(float(i)) for i in range(200)]
+    tokenizer = _make_tokenizer_mock(tokens_per_output=5)
+    result = _compute_steady_state_result(
+        outputs=outputs,
+        tokenizer=tokenizer,
+        gpu_metrics=None,
+        cpu_metrics=None,
+        max_concurrency=None,
+        max_concurrent_conversations=None,
+        collect_gpu_stats=False,
+        metrics_by_endpoint=None,
+    ).to_result_dict()
+
+    assert set(result.keys()) == {
+        # Detection metadata — always present.
+        "steady_state_detected",
+        "steady_state_start_index",
+        "steady_state_end_index",
+        "steady_state_count",
+        "steady_state_warning",
+        "steady_state_mode",
+        # Per-metric summaries — present when detected and ≥2 valid requests.
+        "steady_state_request_throughput",
+        "steady_state_mean_ttft_ms",
+        "steady_state_p99_ttft_ms",
+        "steady_state_mean_tpot_ms",
+        "steady_state_p99_tpot_ms",
+        "steady_state_mean_itl_ms",
+        "steady_state_p99_itl_ms",
+        "steady_state_mean_latency_ms",
+        "steady_state_p99_latency_ms",
+        # Confidence-interval keys for each latency metric.
+        "steady_state_ttft_ms_ci_lower",
+        "steady_state_ttft_ms_ci_upper",
+        "steady_state_ttft_ms_ci_relative_width",
+        "steady_state_ttft_ms_confidence",
+        "steady_state_ttft_ms_sample_size",
+        "steady_state_tpot_ms_ci_lower",
+        "steady_state_tpot_ms_ci_upper",
+        "steady_state_tpot_ms_ci_relative_width",
+        "steady_state_tpot_ms_confidence",
+        "steady_state_tpot_ms_sample_size",
+        "steady_state_itl_ms_ci_lower",
+        "steady_state_itl_ms_ci_upper",
+        "steady_state_itl_ms_ci_relative_width",
+        "steady_state_itl_ms_confidence",
+        "steady_state_itl_ms_sample_size",
+        "steady_state_latency_ms_ci_lower",
+        "steady_state_latency_ms_ci_upper",
+        "steady_state_latency_ms_ci_relative_width",
+        "steady_state_latency_ms_confidence",
+        "steady_state_latency_ms_sample_size",
+    }
+
+    assert result["steady_state_detected"] is True
+    assert result["steady_state_mode"] == "full"
+    assert result["steady_state_start_index"] is not None
+    assert result["steady_state_end_index"] is not None
+    assert isinstance(result["steady_state_count"], int)
+    assert result["steady_state_count"] > 0
+    assert result["steady_state_warning"] is None
+    # With ttft=0.05 s the mean should be ≈50 ms.
+    assert result["steady_state_mean_ttft_ms"] == pytest.approx(50.0, rel=0.05)
+
+
+# ---------------------------------------------------------------------------
+# _pick_warmup_population
+# ---------------------------------------------------------------------------
+
+
+def _fake_session(session_id: int, num_turns: int) -> ChatSession:
+    msgs: list[ChatMessage] = []
+    for _ in range(num_turns):
+        msgs.append(ChatMessage(source="user", content="u", num_tokens=1))
+        msgs.append(ChatMessage(source="assistant", content="a", num_tokens=1))
+    return ChatSession(id=session_id, messages=msgs)
+
+
+def _fixed_pool(turn_counts: list[int]) -> list[ChatSession]:
+    return [_fake_session(i, t) for i, t in enumerate(turn_counts)]
+
+
+def test_pick_warmup_off_returns_unchanged() -> None:
+    pool = _fixed_pool([3, 5, 7, 11])
+    sessions, report = _pick_warmup_population(
+        pool,
+        warmup_count=2,
+        warmup_to_steady_state=False,
+        warmup_oversample_factor=8,
+        main_pool_target=4,
+        rng=np.random.default_rng(0),
+    )
+    assert report is None
+    assert sessions == pool
+    assert all(s.prefix_turns == 0 for s in sessions)
+
+
+def test_pick_warmup_zero_count_returns_unchanged() -> None:
+    pool = _fixed_pool([3, 5, 7])
+    sessions, report = _pick_warmup_population(
+        pool,
+        warmup_count=0,
+        warmup_to_steady_state=True,
+        warmup_oversample_factor=8,
+        main_pool_target=3,
+        rng=np.random.default_rng(0),
+    )
+    assert report is None
+    assert sessions == pool
+
+
+def test_pick_warmup_factor_one_uniform_emits_report() -> None:
+    # factor=1 has no length-bias headroom; falls through to uniform pick.
+    # Report still emitted so the user can see the bias.
+    pool = _fixed_pool([3, 5, 7, 11, 13])
+    sessions, report = _pick_warmup_population(
+        pool,
+        warmup_count=2,
+        warmup_to_steady_state=True,
+        warmup_oversample_factor=1,
+        main_pool_target=3,
+        rng=np.random.default_rng(0),
+    )
+    assert report is not None
+    assert report.factor == 1
+    # Warmup picks at the head, prefix_turns assigned (0 for T=1).
+    assert len(sessions) == len(pool)
+    assert all(s.prefix_turns >= 0 for s in sessions[:2])
+    # Main sessions (last 3) untouched: prefix_turns=0.
+    assert all(s.prefix_turns == 0 for s in sessions[2:])
+
+
+def test_pick_warmup_factor_zero_uniform_emits_report() -> None:
+    # factor=0 behaves the same as factor=1 — uniform pick.
+    pool = _fixed_pool([3, 5, 7, 11, 13])
+    sessions, report = _pick_warmup_population(
+        pool,
+        warmup_count=2,
+        warmup_to_steady_state=True,
+        warmup_oversample_factor=0,
+        main_pool_target=5,
+        rng=np.random.default_rng(0),
+    )
+    assert report is not None
+    assert report.factor == 0
+    assert len(sessions) == len(pool)
+
+
+def test_pick_warmup_length_biased_basic() -> None:
+    rng = np.random.default_rng(123)
+    # Pool of 144 sessions: 16 main sessions + 8*16 = 128 candidates.
+    main = 16
+    factor = 8
+    M = 16
+    turn_pool = list(rng.integers(1, 50, size=main + factor * M))
+    pool = _fixed_pool([int(t) for t in turn_pool])
+    sessions, report = _pick_warmup_population(
+        pool,
+        warmup_count=M,
+        warmup_to_steady_state=True,
+        warmup_oversample_factor=factor,
+        main_pool_target=main,
+        rng=rng,
+    )
+    assert report is not None
+    assert report.factor == factor
+    assert report.warmup_pool == factor * M
+    assert report.main_pool == main
+    assert report.warmup_count == M
+    # All warmup picks at head; main sessions at tail with prefix_turns=0.
+    assert len(sessions) == M + main
+    warmup_picks = sessions[:M]
+    main_sessions = sessions[M:]
+    assert all(s.prefix_turns >= 0 for s in warmup_picks)
+    assert any(s.prefix_turns > 0 for s in warmup_picks)
+    assert all(s.prefix_turns == 0 for s in main_sessions)
+
+
+def test_pick_warmup_length_biased_matches_size_biased_target() -> None:
+    """Systematic PPS gives E[realized_mean] = target_mean exactly when no
+    items cap. Average across many draws should be within ~1% of target."""
+    main = 32
+    M = 32
+    factor = 8
+    realized_means: list[float] = []
+    target_mean: float | None = None
+    for seed in range(50):
+        rng = np.random.default_rng(seed)
+        turn_pool = list(rng.integers(1, 60, size=main + factor * M))
+        pool = _fixed_pool([int(t) for t in turn_pool])
+        _, report = _pick_warmup_population(
+            pool,
+            warmup_count=M,
+            warmup_to_steady_state=True,
+            warmup_oversample_factor=factor,
+            main_pool_target=main,
+            rng=rng,
+        )
+        assert report is not None
+        realized_means.append(report.realized_mean)
+        target_mean = report.target_mean
+    assert target_mean is not None
+    avg_realized = float(np.mean(realized_means))
+    # 50 draws of K=32 averages out to ~1600 picks of T; the analytical bias
+    # is 0 (no caps) and per-draw stddev averages out fast.
+    assert abs(avg_realized - target_mean) / target_mean < 0.02
+
+
+def test_pick_warmup_realized_mean_stdev_brackets_observed_spread() -> None:
+    """The reported per-draw stdev should upper-bound the actual spread of
+    realized_mean across seeds (with-replacement bound; systematic PPS
+    variance is at most this)."""
+    main = 32
+    M = 32
+    factor = 8
+    realized_means: list[float] = []
+    stdev: float | None = None
+    for seed in range(60):
+        rng = np.random.default_rng(seed)
+        turn_pool = list(rng.integers(1, 60, size=main + factor * M))
+        pool = _fixed_pool([int(t) for t in turn_pool])
+        _, report = _pick_warmup_population(
+            pool,
+            warmup_count=M,
+            warmup_to_steady_state=True,
+            warmup_oversample_factor=factor,
+            main_pool_target=main,
+            rng=rng,
+        )
+        assert report is not None
+        realized_means.append(report.realized_mean)
+        stdev = report.realized_mean_stdev
+    assert stdev is not None
+    assert stdev > 0
+    observed_std = float(np.std(realized_means, ddof=1))
+    # Reported stdev is a with-replacement upper bound; observed should be
+    # at most ~1.3x stdev even with sampling noise on the std estimate.
+    assert observed_std <= 1.3 * stdev
+
+
+# ---------------------------------------------------------------------------
+# _log_warmup_sampling_report
+# ---------------------------------------------------------------------------
+
+
+def _make_report(
+    target_mean: float = 20.0,
+    realized_mean: float = 20.0,
+    realized_mean_stdev: float = 1.0,
+    cap_count: int = 0,
+) -> _WarmupSamplingReport:
+    return _WarmupSamplingReport(
+        warmup_pool=128,
+        main_pool=100,
+        warmup_count=16,
+        factor=8,
+        target_mean=target_mean,
+        realized_mean=realized_mean,
+        realized_mean_stdev=realized_mean_stdev,
+        cap_count=cap_count,
+    )
+
+
+def test_log_warmup_sampling_report_no_caps_no_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    report = _make_report(cap_count=0)
+    with caplog.at_level("WARNING"):
+        _log_warmup_sampling_report(report)
+    assert not any(
+        "Could not warmup to steady state" in r.message for r in caplog.records
+    )
+
+
+def test_log_warmup_sampling_report_caps_warn(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    report = _make_report(cap_count=3)
+    with caplog.at_level("WARNING"):
+        _log_warmup_sampling_report(report)
+    assert any(
+        "Could not warmup to steady state" in r.message for r in caplog.records
+    )
+
+
+# ---------------------------------------------------------------------------
+# systematic_probability_proportional_to_size
+# ---------------------------------------------------------------------------
+
+
+def test_systematic_pps_no_duplicates() -> None:
+    rng = np.random.default_rng(0)
+    weights = rng.integers(1, 50, size=100).astype(np.float64)
+    for _ in range(500):
+        idx = systematic_probability_proportional_to_size(weights, 20, rng)
+        assert len(idx) == 20
+        assert len(set(idx.tolist())) == 20
+
+
+def test_systematic_pps_inclusion_probability_matches_weight() -> None:
+    """Empirical P(item i picked) ≈ K * w_i / W when no item caps."""
+    rng = np.random.default_rng(1)
+    weights = np.array([1, 2, 3, 5, 8, 13, 21], dtype=np.float64)
+    K = 3
+    # K * max(w) / W = 3 * 21 / 53 = 1.19 > 1 → cap. Lower K to avoid cap
+    # for the matching-probability check.
+    K = 2
+    cap_thresh = weights.sum() / K
+    assert (weights < cap_thresh).all()
+    n_trials = 20000
+    counts = np.zeros(len(weights), dtype=np.int64)
+    for _ in range(n_trials):
+        idx = systematic_probability_proportional_to_size(weights, K, rng)
+        counts[idx] += 1
+    expected = K * weights / weights.sum()
+    actual = counts / n_trials
+    assert np.allclose(actual, expected, atol=0.02)
+
+
+def test_systematic_pps_iterated_cap_pre_includes() -> None:
+    """An item with weight >= W/K is always included."""
+    rng = np.random.default_rng(2)
+    weights = np.array([1, 1, 1, 1, 100], dtype=np.float64)
+    K = 2
+    # weights[4] = 100 >> W/K = 104/2 = 52.
+    for _ in range(200):
+        idx = systematic_probability_proportional_to_size(weights, K, rng)
+        assert 4 in idx.tolist()
+
+
+def test_systematic_pps_mean_matches_size_biased() -> None:
+    """E[mean of picks] = sum(T^2) / sum(T) when no item caps."""
+    rng = np.random.default_rng(3)
+    T = rng.integers(1, 50, size=200).astype(np.float64)
+    K = 8
+    cap_thresh = T.sum() / K
+    assert (T < cap_thresh).all()
+    sb_mean = float((T * T).sum() / T.sum())
+    realized = []
+    for _ in range(500):
+        idx = systematic_probability_proportional_to_size(T, K, rng)
+        realized.append(float(T[idx].mean()))
+    avg = float(np.mean(realized))
+    assert abs(avg - sb_mean) / sb_mean < 0.01

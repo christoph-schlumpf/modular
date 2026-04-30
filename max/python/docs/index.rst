@@ -50,6 +50,7 @@ Modules
    pipelines.architectures.deepseekV3
    pipelines.architectures.deepseekV3_2
    pipelines.architectures.deepseekV3_nextn
+   pipelines.architectures.eagle3_deepseekV3
    pipelines.architectures.eagle_llama3
    pipelines.architectures.exaone
    pipelines.architectures.exaone_modulev3
@@ -89,11 +90,13 @@ Modules
    pipelines.architectures.qwen2
    pipelines.architectures.qwen2_5vl
    pipelines.architectures.qwen3
+   pipelines.architectures.qwen3_5
    pipelines.architectures.qwen3_embedding
    pipelines.architectures.qwen3_embedding_modulev3
    pipelines.architectures.qwen3vl_moe
    pipelines.architectures.qwen_image
    pipelines.architectures.qwen_image_edit
+   pipelines.architectures.step3p5
    pipelines.architectures.unified_eagle_llama3
    pipelines.architectures.unified_mtp_deepseekV3
    pipelines.architectures.wan

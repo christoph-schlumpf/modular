@@ -239,8 +239,16 @@ def update_spec_decode_context_and_prepare_responses(
     next_tokens: npt.NDArray[np.int32],
     context_batch: list[TextGenerationContextType],
     max_seq_len: int,
+    think_start_token_id: int | None = None,
+    think_end_token_id: int | None = None,
 ) -> dict[RequestID, TextGenerationOutput]:
-    """Updates context objects and prepares response objects after speculative decoding."""
+    """Updates context objects and prepares response objects after speculative decoding.
+
+    When both boundary ids are provided, also toggles
+    ``ctx.in_reasoning_phase`` from the just-committed tokens, in commit
+    order so a ``<think>...</think>`` pair within one accept set ends
+    correctly.
+    """
     num_draft_tokens_to_verify = draft_tokens.shape[1]
     num_speculative_tokens = next_draft_tokens.shape[1]
 
@@ -253,6 +261,10 @@ def update_spec_decode_context_and_prepare_responses(
     assert all(
         num_accept <= num_draft_tokens_to_verify
         for num_accept in num_accepted_draft_tokens
+    )
+
+    track_phase = (
+        think_start_token_id is not None and think_end_token_id is not None
     )
 
     # Handle chunked prefill case where there are no future tokens.
@@ -277,6 +289,13 @@ def update_spec_decode_context_and_prepare_responses(
                 break
             else:
                 ctx.update(token)
+
+        if track_phase:
+            for token in tokens:
+                if token == think_start_token_id:
+                    ctx.in_reasoning_phase = True
+                elif token == think_end_token_id:
+                    ctx.in_reasoning_phase = False
 
         ctx.spec_decoding_state.maybe_accepted_draft_tokens = []
         if not ctx.is_done:
@@ -396,21 +415,17 @@ class StructuredOutputHelper:
         context: TextGenerationContextType,
         bitmask: npt.NDArray[np.int32],
         index: int,
-        support_jump_ahead: bool = True,
     ) -> None:
         """Update context and bitmask for structured output.
 
         If a json_schema is present and no matcher is set, this compiles a
-        grammar matcher and installs it on the context. Optionally applies
-        jump-ahead tokens, then fills the per-request token bitmask.
+        grammar matcher and installs it on the context, then fills the
+        per-request token bitmask.
 
         Args:
             context: Request context to update.
             bitmask: Preallocated bitmask buffer; updated in-place.
             index: Position in the bitmask for this request.
-            support_jump_ahead: Whether to apply jump-ahead tokens. Set to
-                False for overlap scheduling where jump-ahead would break
-                CUDA graph capture.
 
         Raises:
             ValueError: If a JSON schema is provided but structured output
@@ -439,12 +454,6 @@ class StructuredOutputHelper:
                 context.json_schema = None  # type: ignore
 
         if context.matcher:
-            if support_jump_ahead:
-                # Jump ahead in generation if possible.
-                jump_forward_tokens = context.matcher.compute_ff_tokens()
-                for token in jump_forward_tokens:
-                    context.jump_ahead(token)
-
             # Fill the bitmask for this context.
             self.fill_bitmask(context, bitmask, index)
 

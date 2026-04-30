@@ -1309,6 +1309,11 @@ class ImageGenerationOracle(PipelineOracle):
 
 
 PIPELINE_ORACLES: Mapping[str, PipelineOracle] = {
+    "stepfun-ai/Step-3.5-Flash": GenericOracle(
+        model_path="stepfun-ai/Step-3.5-Flash",
+        config_params={"trust_remote_code": True},
+        device_encoding_map={"gpu": ["bfloat16"]},
+    ),
     "allenai/OLMo-1B-hf": GenericOracle(
         model_path="allenai/OLMo-1B-hf",
         config_params={"max_length": 1024},
@@ -1835,6 +1840,17 @@ PIPELINE_ORACLES: Mapping[str, PipelineOracle] = {
             "data_parallel_degree": 8,
         },
         device_encoding_map={"gpu": ["float8_e4m3fn"]},
+    ),
+    "lukealonso/MiniMax-M2.7-NVFP4": GenericOracle(
+        model_path="lukealonso/MiniMax-M2.7-NVFP4",
+        config_params={
+            "max_length": 516,
+            "trust_remote_code": True,
+            "max_batch_input_tokens": 512,
+            "ep_size": 8,
+            "data_parallel_degree": 8,
+        },
+        device_encoding_map={"gpu": ["float4_e2m1fnx2"]},
     ),
     "HKUSTAudio/Llasa-8B": GenericOracle(
         model_path="HKUSTAudio/Llasa-8B",

@@ -27,6 +27,7 @@ from __future__ import annotations
 import copy
 import logging
 import sys
+import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
 from contextlib import AbstractContextManager
@@ -316,6 +317,18 @@ class ServeGraphCaptureRunner:
 
         self.graph_entries: dict[GraphKey, GraphEntry] = {}
 
+    def release_graph(self, key: GraphKey) -> None:
+        """Releases a single captured graph and its working memory.
+
+        Drops the runner's entry for ``key`` (input + output buffer handles)
+        and asks the engine to release the underlying device graph. Safe to
+        call when ``key`` is not currently captured: the runner-side ``pop``
+        becomes a no-op and the engine-side release is itself a no-op for
+        unknown keys.
+        """
+        self.graph_entries.pop(key, None)
+        self._model.release_captured_graph(_pack_model_graph_key(key))
+
     def dispatch_metadata(
         self, batch_size: int, q_max_seq_len: int
     ) -> list[tuple[int, Buffer, Buffer | None]]:
@@ -462,6 +475,17 @@ class ServeGraphCaptureRunner:
                         outputs
                     )
                     self.graph_entries[key] = (input_buffers, outputs)
+
+        if hasattr(self._model, "_await_device_graphs"):
+            logger.info(
+                "Awaiting remaining device graph instantiation threads."
+            )
+            t0 = time.perf_counter()
+            self._model._await_device_graphs()
+            logger.info(
+                "Device graph instantiation complete in %.3fs.",
+                time.perf_counter() - t0,
+            )
 
         logger.info(
             "Overlap device graph pre-capture complete for decode batch sizes "

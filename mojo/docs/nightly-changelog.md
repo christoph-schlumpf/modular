@@ -1,4 +1,6 @@
-# Nightly: v0.26.3
+---
+title: Mojo nightly
+---
 
 This version is still a work in progress.
 
@@ -6,10 +8,64 @@ This version is still a work in progress.
 
 ## Documentation
 
+- Compilation targets docs instructs how to inspect your current platform,
+  select a target configuration, and generate code for that target. Use it to
+  build for your own system or target other CPUs, operating systems, and
+  accelerators.
+
+- Mojo language reference covers lexical elements, expressions, statements,
+  numeric types, struct declarations, trait declarations.
+
+- Functions reference page improves discoverability of new function features.
+
+- Split operators manual into separate pages; refreshed coverage and added
+  tutorial, operator tests, and new reference page.
+
+- Negative examples and errors added to reference pages highlight sharp
+  edges of the language.
+
+- MLIR reference page introduces inline MLIR to developers in Mojo code.
+
+- Adds docs for non-nullable pointers and provides sample code showing
+  how to use `Optional` with `UnsafePointer`.
+
 ## Language enhancements
 
-- Mojo now uses `NoneType` instead of an empty tuple to mark constructor using
-  literals.
+- Added type refinement based on compile time assumptions, enabling Mojo to
+  narrow types from `where` clauses, `comptime if` statements, and
+  `comptime assert` statements. Refinements in a scope are driven by
+  `conforms_to()` expressions.
+
+  Before:
+
+  ```mojo
+  def __contains__(self, value: Self.T) -> Bool where conforms_to(Self.T, Equatable):
+      for item in self:
+          if trait_downcast[Equatable](item) == trait_downcast[Equatable](value):
+              return True
+      return False
+  ```
+
+  After:
+
+  ```mojo
+  def __contains__(self, value: Self.T) -> Bool where conforms_to(Self.T, Equatable):
+      for item in self:
+          if item == value:
+              return True
+      return False
+  ```
+
+- Improved diagnostics for onboarding-priority parser errors in Mojo
+  for clarity and UX.
+
+- Migrated monorepo from `fn` to using `def` for function declaration.
+  Warned on use of `fn` and will deprecate `fn` in the next release.
+
+- Updated signature error diagnostics and added related tests.
+
+- Mojo now uses `NoneType` instead of an empty tuple to mark constructor
+  using literals.
 
 - The ternary `if/else` expression now coerces each element to its contextual
   type when it is obvious. For example, this works instead of producing an
@@ -123,6 +179,64 @@ This version is still a work in progress.
 
 ## Library changes
 
+- Removed explicit `trait_downcast`/`trait_downcast_var` across the standard
+  library sources, now that Mojo applies type refinement from comptime
+  assumptions. Public APIs are unchanged. Updated files:
+  - `stdlib/std/builtin/`: `_stubs.mojo`, `bool.mojo`
+  - `stdlib/std/collections/`: `deque.mojo`, `dict.mojo`, `inline_array.mojo`,
+    `linked_list.mojo`, `list.mojo`, `optional.mojo`, `set.mojo`
+  - `stdlib/std/iter/__init__.mojo`, `stdlib/std/itertools/itertools.mojo`
+  - `stdlib/std/memory/`: `arc_pointer.mojo`, `owned_pointer.mojo`, `span.mojo`
+
+- Consolidated the reflection APIs in `std.reflection` behind a unified entry
+  point `reflect[T]()` returning a `Reflected[T]` handle. `reflect` is
+  auto-imported via the prelude, so it is available without an explicit
+  import. Methods on the handle replace the family of `struct_field_*` free
+  functions (dropping the `struct_` prefix — only structs have fields) and
+  the `get_type_name` / `get_base_type_name` free functions:
+
+  ```mojo
+  struct Point:
+      var x: Int
+      var y: Float64
+
+  def main():
+      comptime r = reflect[Point]()
+      print(r.name())                          # "Point"
+      print(r.field_count())                   # 2
+      print(r.field_names()[0])                # x
+      comptime y_type = r.field_type["y"]()    # Reflected[Float64]
+      print(y_type.name())                     # "SIMD[DType.float64, 1]"
+      print(reflect[List[Int]]().base_name())  # "List"
+      var v: y_type.T = 3.14
+  ```
+
+  Methods on `Reflected[T]`: `name[qualified_builtins=]`, `base_name`,
+  `is_struct`, `field_count`, `field_names`, `field_types`,
+  `field_index[name]`, `field_type[name]`,
+  `field_offset[name=]/[index=]`, and `field_ref[idx](s)`. The
+  `field_type[name]()` method returns a `Reflected[FieldT]`, so reflection
+  is fully composable.
+
+  The legacy free functions — `struct_field_count`, `struct_field_names`,
+  `struct_field_types`, `struct_field_index_by_name`,
+  `struct_field_type_by_name`, `struct_field_ref`, `is_struct_type`,
+  `offset_of`, `get_type_name`, `get_base_type_name` — and the
+  `ReflectedType[T]` wrapper are now `@deprecated` and delegate to the new
+  API. They will be removed in a future release.
+
+- Added `struct_field_ref[idx, T](ref s)` to `std.reflection` for accessing
+  struct fields by index without copying. The function returns a reference
+  with the same mutability as `s` and works with both concrete and generic
+  struct types, including parametric indices in `comptime for` loops. The
+  default implementations of `Hashable`, `Equatable`, and `Writable` now use
+  this library function instead of the `__struct_field_ref` magic.
+
+- The `Boolable`, `Defaultable`, and `Writable` traits no longer inherit from
+  `ImplicitlyDestructible`. Generic code that relied on receiving the
+  destructor bound transitively through these traits must now spell it out
+  explicitly, for example `T: Writable & ImplicitlyDestructible`.
+
 - The `Variadic` suite of low-level operation has been refactored and migrated
   to being members of the `TypeList` and `ParameterList` types, making them more
   ergonomic to work with and more accessible.
@@ -175,6 +289,26 @@ This version is still a work in progress.
   is dominated by forward-scan length: small in text containing line breaks
   or whitespace, growing with the distance back to such a codepoint in long
   runs without them.
+
+- Added grapheme-aware algorithms on `String` and `StringSlice`:
+  - `grapheme_indices()` returns a `GraphemeIndicesIter` that yields
+    `(byte_offset, grapheme)` pairs, mirroring Rust's
+    `str::grapheme_indices`. Useful for text editors or UIs that need to
+    map cursor byte positions back to grapheme boundaries.
+  - `nth_grapheme(n)` returns the `n`-th grapheme cluster as an
+    `Optional[StringSlice]`, or `None` when `n` is out of range.
+  - `split_at_grapheme(n)` returns `Tuple[StringSlice, StringSlice]`
+    holding the prefix `[0, n)` and suffix `[n, count)` of grapheme
+    clusters in a single pass, clamping `n` to the total count.
+
+- `count_graphemes()` now takes a fast path over runs of printable ASCII
+  (U+0020..U+007E). Each such byte has GBP `Other` and two consecutive
+  safe-ASCII bytes always have a grapheme-cluster break between them
+  (GB999), so safe-ASCII runs can be counted at one grapheme per byte
+  without entering the UAX #29 state machine. On pure-ASCII text this is
+  roughly 10x faster (~0.38 ms vs. ~3.85 ms for 1 MB of English), and
+  ~5-6x faster on ASCII-dominant mixed text (Spanish UN charter). Pure
+  non-ASCII text (Arabic, Russian, Chinese) is unchanged.
 
 - Variadics of types have been moved to the `TypeList` struct.
   One can write operations such as:
@@ -462,6 +596,10 @@ This version is still a work in progress.
 
 ## Tooling changes
 
+- The Mojo debugger now shows a `Variant` variable's active type name and
+  value in LLDB — e.g. `Int(42)` or `String("hello")` — instead of exposing
+  raw `_DefaultVariantStorage` internals.
+
 - The Mojo debugger now displays scalar types (e.g. `UInt8`, `Float32`) as
   plain values instead of `([0] = value)`, and elides internal `_mlir_value`
   wrapper fields from struct display.
@@ -505,6 +643,15 @@ This version is still a work in progress.
 
 ## 🛠️ Fixed
 
+- Fixed `math.sqrt` on `Float64` on NVIDIA GPU producing a cryptic
+  `could not find LLVM intrinsic: "llvm.nvvm.sqrt.approx.d"` failure at LLVM
+  IR translation time. `math.sqrt` now rejects `Float64` on NVIDIA GPU at
+  compile time with the message `DType.float64 isn't supported for approx
+  sqrt on NVIDIA GPU`. The existing `math.sin` and `math.cos` constraint
+  messages were also sharpened to name the op (`DType.float64 isn't supported
+  for sin/cos on NVIDIA GPU`).
+  ([Issue #6434](https://github.com/modular/modular/issues/6434))
+
 - Fixed pack inference failing with `could not infer type of parameter pack ...
   given value with unresolved type` when passing list, dict, set, or slice
   literals to a `*Ts`-bound variadic pack parameter (e.g.
@@ -519,6 +666,17 @@ This version is still a work in progress.
   config search now treats permission errors as "not found" and falls through
   to the next candidate.
   ([Issue #6412](https://github.com/modular/modular/issues/6412))
+
+- `mojo run` and `mojo debug` now honor `-Xlinker` flags by loading the
+  referenced shared libraries into the in-process JIT. Previously the flags
+  were dropped (with a `-Xlinker argument unused` warning), leaving programs
+  that called into external shared libraries via `external_call` unable to
+  resolve those symbols at runtime (so `mojo build` worked but `mojo run` did
+  not). The supported forms mirror what the system linker accepts: `-Xlinker
+  -L<dir>`, `-Xlinker -l<name>`, `-Xlinker -rpath <dir>`, and `-Xlinker
+  <absolute-path-to-shared-library>`. Flags that have no meaning under JIT
+  are reported as a warning and ignored.
+  ([Issue #6155](https://github.com/modular/modular/issues/6155))
 
 - Fixed `libpython` auto-discovery failing for Python 3.14 free-threaded builds.
   The discovery script constructed the library filename without the ABI flags

@@ -32,7 +32,7 @@ from urllib.parse import unquote, urlparse
 import aiofiles
 from fastapi import APIRouter, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
-from httpx import AsyncClient
+from httpx import AsyncClient, HTTPStatusError
 from max.interfaces import (
     AudioGenerationRequest,
     GenerationStatus,
@@ -96,6 +96,7 @@ from max.serve.schemas.openai import (
     Logprobs2,
     Model,
     PromptItem,
+    PromptTokensDetails,
     ResponseFormatJsonObject,
     ResponseFormatJsonSchema,
     ResponseFormatText,
@@ -245,6 +246,7 @@ class OpenAIChatResponseGenerator(
         n_reasoning_tokens = 0
         n_tokens = 0
         n_prompt_tokens = 0
+        n_cached_prompt_tokens = 0
         status_code = 200
         try:
             async for chunk in self.pipeline.next_token_chunk(request):
@@ -260,6 +262,9 @@ class OpenAIChatResponseGenerator(
 
                 if chunk.prompt_token_count:
                     n_prompt_tokens = chunk.prompt_token_count
+
+                if chunk.cached_token_count is not None:
+                    n_cached_prompt_tokens = chunk.cached_token_count
 
                 # We support N = 1 at the moment and will generate a single choice.
                 # The choice index is set to 0.
@@ -341,6 +346,9 @@ class OpenAIChatResponseGenerator(
                     total_tokens=n_prompt_tokens
                     + n_reasoning_tokens
                     + n_tokens,
+                    prompt_tokens_details=PromptTokensDetails(
+                        cached_tokens=n_cached_prompt_tokens,
+                    ),
                 )
 
                 final_response = CreateChatCompletionStreamResponse(
@@ -401,6 +409,7 @@ class OpenAIChatResponseGenerator(
         n_reasoning_tokens = 0
         n_tokens = 0
         n_prompt_tokens = 0
+        n_cached_prompt_tokens = 0
         request_timer = StopWatch(start_ns=request.timestamp_ns)
         status_code = 200
         tool_use = request.tools is not None
@@ -414,6 +423,10 @@ class OpenAIChatResponseGenerator(
             n_tokens = sum(chunk.token_count for chunk in completed_outputs)
             if len(completed_outputs) > 0:
                 n_prompt_tokens = completed_outputs[0].prompt_token_count or 0
+                if completed_outputs[0].cached_token_count is not None:
+                    n_cached_prompt_tokens = completed_outputs[
+                        0
+                    ].cached_token_count
 
             response_message = "".join(
                 chunk.decoded_tokens
@@ -504,6 +517,9 @@ class OpenAIChatResponseGenerator(
                     total_tokens=n_prompt_tokens
                     + n_reasoning_tokens
                     + n_tokens,
+                    prompt_tokens_details=PromptTokensDetails(
+                        cached_tokens=n_cached_prompt_tokens,
+                    ),
                 )
 
             response = CreateChatCompletionResponse(
@@ -751,7 +767,15 @@ async def resolve_image_from_url(
     if image_ref.scheme == "http" or image_ref.scheme == "https":
         # TODO: Evaluate creating a single AsyncClient for the app.
         async with AsyncClient() as client:
-            response = await client.get(str(image_ref), follow_redirects=True)
+            try:
+                response = await client.get(
+                    str(image_ref), follow_redirects=True
+                )
+                response.raise_for_status()
+            except HTTPStatusError as e:
+                raise ValueError(
+                    f"Failed to fetch image: HTTP {e.response.status_code}"
+                ) from e
             images_bytes = await response.aread()
             logger.debug(
                 "ResolvedImageUrl: %s -> %d bytes", image_ref, len(images_bytes)
@@ -921,6 +945,7 @@ async def openai_create_chat_completion(
                 top_p=completion_request.top_p,
                 min_p=completion_request.min_p,
                 temperature=completion_request.temperature,
+                thinking_temperature=completion_request.thinking_temperature,
                 frequency_penalty=completion_request.frequency_penalty,
                 presence_penalty=completion_request.presence_penalty,
                 repetition_penalty=completion_request.repetition_penalty,
@@ -933,6 +958,7 @@ async def openai_create_chat_completion(
             ),
             sampling_params_defaults=request.app.state.pipeline_config.model.sampling_params_defaults,
         )
+
         # For chat completions, logprobs is a bool and top_logprobs is the count.
         # We pass top_logprobs (or 1 if logprobs=True but top_logprobs not set).
         logprobs_count = 0
@@ -1038,22 +1064,25 @@ def _create_response_format(
     if not response_format:
         return None
 
-    # We don't have llguidance grammar for generic JSON output.
-    # Only json_schema is supported for structured output.
-    if response_format.type == "json_object":
-        raise ValueError(
-            "'json_object' response format is not supported. Use 'json_schema' instead for structured output."
-        )
-
     json_schema: dict[Any, Any] = {}
-    if (
+
+    response_type = response_format.type
+    if response_format.type == "json_object":
+        # For json_object mode (any valid JSON), use a permissive schema that
+        # accepts any JSON object. llguidance's grammar_from_json_schema supports
+        # this - an empty or minimal schema means "any valid JSON".
+        json_schema = {"type": "object"}
+        # Normalize type to json_schema for the internal representation since both
+        # json_object and json_schema use grammar-based constrained decoding.
+        response_type = "json_schema"
+    elif (
         response_format.type == "json_schema"
         and response_format.json_schema.schema_ is not None
     ):
         json_schema = response_format.json_schema.schema_.model_dump()
 
     return TextGenerationResponseFormat(
-        type=response_format.type, json_schema=json_schema
+        type=response_type, json_schema=json_schema
     )
 
 
@@ -1515,6 +1544,7 @@ async def openai_create_completion(
                     top_p=completion_request.top_p,
                     min_p=completion_request.min_p,
                     temperature=completion_request.temperature,
+                    thinking_temperature=completion_request.thinking_temperature,
                     frequency_penalty=completion_request.frequency_penalty,
                     presence_penalty=completion_request.presence_penalty,
                     repetition_penalty=completion_request.repetition_penalty,

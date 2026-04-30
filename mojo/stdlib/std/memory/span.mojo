@@ -20,7 +20,7 @@ from std.memory import Span
 ```
 """
 from std.builtin.builtin_slice import ContiguousSlice
-from std.reflection import call_location
+from std.reflection import call_location, reflect
 from std.bit.mask import splat
 from std.bit import pop_count
 from std.memory import pack_bits, uninit_copy_n
@@ -32,7 +32,6 @@ from std.sys.info import simd_width_of
 from std.algorithm import vectorize
 from std.hashlib import Hasher
 from std.builtin.device_passable import DevicePassable
-from std.compile import get_type_name
 import std.format._utils as fmt
 
 
@@ -194,7 +193,7 @@ struct Span[
         """
         return String(
             "Span[",
-            get_type_name[Self.T](),
+            reflect[Self.T]().name(),
             "]",
         )
 
@@ -431,9 +430,7 @@ struct Span[
             otherwise.
         """
         for i in range(len(self)):
-            if trait_downcast[Equatable](self[i]) == trait_downcast[Equatable](
-                value
-            ):
+            if self[i] == value:
                 return True
         return False
 
@@ -492,7 +489,7 @@ struct Span[
         """
         hasher._update_with_simd(Int64(len(self)))
         for i in range(len(self)):
-            trait_downcast[Hashable](self[i]).__hash__(hasher)
+            self[i].__hash__(hasher)
 
     # ===------------------------------------------------------------------===#
     # Methods
@@ -915,7 +912,7 @@ struct Span[
         var length = UInt(len(self))
         var value = needle - Scalar[dtype](1)  # just to make it different
         while length > 0:
-            var half = length >> UInt(Int(length > 1))
+            var half = length >> 1 if length > 1 else length
             length -= half
             value = self.unsafe_get(cursor + half - 1)
             cursor += UInt(splat(value < needle)) & half

@@ -298,10 +298,6 @@ class TextGenerationRequest:
     the generated output. This can be useful for debugging or when you want to
     see how the input relates to the output.
     """
-    stop: str | list[str] | None = None
-    """
-    Optional list of stop expressions (see: https://platform.openai.com/docs/api-reference/chat/create#chat-create-stop)
-    """
     chat_template_options: dict[str, Any] | None = None
     """
     Optional dictionary of options to pass when applying the chat template.
@@ -424,6 +420,9 @@ class TextGenerationOutput:
     log_probabilities: list[LogProbabilities] | None = None
     """Optional list of log probabilities for each token."""
 
+    num_cached_tokens: int | None = None
+    """Number of prompt tokens served from the KV prefix cache."""
+
     @property
     def is_done(self) -> bool:
         """Indicates whether the text generation process is complete.
@@ -461,6 +460,7 @@ class TextGenerationOutput:
             ),
             log_probabilities=log_probabilities,
             final_status=outputs[-1].final_status,
+            num_cached_tokens=outputs[0].num_cached_tokens,
         )
 
 
@@ -587,7 +587,6 @@ class TextGenerationContext(BaseContext, Protocol):
         self,
         new_token: int,
         log_probabilities: LogProbabilities | None = None,
-        mark_previous_as_processed: bool = True,
     ) -> None:
         """Advance the token buffer without touching FSM state.
 
@@ -601,9 +600,6 @@ class TextGenerationContext(BaseContext, Protocol):
         Args:
             new_token: The token to append to the buffer.
             log_probabilities: Optional log probabilities for this token.
-            mark_previous_as_processed: If True, mark previous tokens as
-                processed. If False, keep them unprocessed so they're
-                returned to the user (used for jump-ahead tokens).
         """
         ...
 
@@ -658,17 +654,6 @@ class TextGenerationContext(BaseContext, Protocol):
         """Overwrite the placeholder future token with the actual token.
 
         This is primarily used for overlap scheduling.
-        """
-        ...
-
-    def jump_ahead(self, new_token: int) -> None:
-        """Jump ahead in generation by adding a token and updating indices.
-
-        This method is used in speculative decoding scenarios to quickly
-        advance the generation state when draft tokens are accepted.
-
-        Args:
-            new_token: The token ID to add when jumping ahead in the sequence.
         """
         ...
 
@@ -767,6 +752,12 @@ class TextGenerationContext(BaseContext, Protocol):
     resets it to ``None`` so chunked-prefill follow-up calls do not
     re-emit.
     """
+
+    in_reasoning_phase: bool
+    """Whether the latest committed tokens are inside a ``<think>...</think>``
+    block. Toggled host-side in the spec-decode commit step when a reasoning
+    parser is configured. Consumed by thinking-mode temperature scaling and
+    relaxed acceptance to gate per-row behavior."""
 
 
 @dataclass

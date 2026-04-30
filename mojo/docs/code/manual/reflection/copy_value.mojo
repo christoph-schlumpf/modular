@@ -11,13 +11,12 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-from std.reflection import struct_field_count, struct_field_types
-
 
 trait MakeCopyable:
     def copy_to(self, mut other: Self):
-        comptime field_count = struct_field_count[Self]()
-        comptime field_types = struct_field_types[Self]()
+        comptime r = reflect[Self]()
+        comptime field_count = r.field_count()
+        comptime field_types = r.field_types()
 
         comptime for idx in range(field_count):
             comptime field_type = field_types[idx]
@@ -27,9 +26,9 @@ trait MakeCopyable:
                 continue
 
             # Perform copy
-            ref p_value = __struct_field_ref(idx, self)
+            ref p_value = r.field_ref[idx](self)
             trait_downcast[Copyable & ImplicitlyDestructible](
-                __struct_field_ref(idx, other)
+                r.field_ref[idx](other)
             ) = trait_downcast[Copyable & ImplicitlyDestructible](
                 p_value
             ).copy()

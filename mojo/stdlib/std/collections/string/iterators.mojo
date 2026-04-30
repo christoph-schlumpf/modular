@@ -21,6 +21,9 @@ from std.collections.string._grapheme_break import (
     _GraphemeBreakState,
     _find_safe_grapheme_start,
     _is_grapheme_break,
+    _is_safe_ascii_for_grapheme,
+    _reset_grapheme_state_to_other,
+    GBP_PREPEND,
 )
 
 
@@ -454,9 +457,10 @@ struct GraphemeSliceIter[
     in text with frequent Control/CR/LF codepoints, growing with the
     distance back to such a codepoint in long runs without them.
 
-    # TODO: Add a SIMD fast path for ASCII runs — every ASCII byte is its
-    # own grapheme, so chunks of `< 0x80` bytes can be counted directly
-    # without entering the state machine.
+    # TODO: Vectorize the existing scalar safe-ASCII fast path. Runs of
+    # safe-ASCII bytes (U+0020..U+007E) are already skipped one-by-one
+    # without entering the state machine; a SIMD check (e.g. `>= 0x20 &
+    # <= 0x7E`) could extend a run by a whole vector width per iteration.
 
     Example:
 
@@ -565,16 +569,32 @@ struct GraphemeSliceIter[
         var count = 0
         var state = _GraphemeBreakState()
         var remaining = self._slice
+        var ptr = remaining.unsafe_ptr()
+        var pos = 0
+        var total = remaining.byte_length()
 
-        while remaining.byte_length() > 0:
-            var cp, num_bytes = Codepoint.unsafe_decode_utf8_codepoint(
-                remaining._slice
-            )
+        while pos < total:
+            # ASCII fast path. Safe-ASCII bytes all have GBP_OTHER. Two
+            # consecutive safe-ASCII bytes always have a break between them
+            # (GB999), and the first in such a run is a break start provided
+            # the previous codepoint's GBP is not Prepend (GB9b). Runs of
+            # safe-ASCII bytes are therefore one-grapheme-per-byte.
+            if _is_safe_ascii_for_grapheme(ptr[pos]) and (
+                state.prev_gbp != GBP_PREPEND
+            ):
+                var run_start = pos
+                while pos < total and _is_safe_ascii_for_grapheme(ptr[pos]):
+                    pos += 1
+                count += pos - run_start
+                _reset_grapheme_state_to_other(state)
+                continue
+
+            # Slow path: decode one codepoint and feed the state machine.
+            var sub = Span[Byte, Self.origin](ptr=ptr + pos, length=total - pos)
+            var cp, num_bytes = Codepoint.unsafe_decode_utf8_codepoint(sub)
             if _is_grapheme_break(state, cp.to_u32()):
                 count += 1
-
-            remaining._slice._data += num_bytes
-            remaining._slice._len -= num_bytes
+            pos += num_bytes
 
         return count
 
@@ -727,3 +747,90 @@ struct GraphemeSliceIter[
                 last_boundary = pos
             pos += num_bytes
         return last_boundary
+
+
+struct GraphemeIndicesIter[mut: Bool, //, origin: Origin[mut=mut]](
+    ImplicitlyCopyable, Iterable, Iterator
+):
+    """Iterator over grapheme clusters paired with their starting byte offset.
+
+    Each call to `__next__()` yields a `Tuple[Int, StringSlice[origin]]` where
+    the first element is the byte offset (relative to the original string)
+    at which the grapheme begins, and the second is the grapheme slice
+    itself.
+
+    Parameters:
+        mut: Whether the slice is mutable.
+        origin: The origin of the underlying string data.
+
+    Mirrors `str::grapheme_indices` from Rust's `unicode-segmentation` crate.
+    Useful for text editors and UIs that need to map cursor byte positions
+    back to grapheme boundaries.
+
+    Example:
+
+    ```mojo
+    %# from testing import assert_equal
+    var s = StringSlice("abc")
+    var pairs = List[Tuple[Int, String]]()
+    for off, g in s.grapheme_indices():
+        pairs.append((off, String(g)))
+    assert_equal(len(pairs), 3)
+    assert_equal(pairs[0][0], 0)
+    assert_equal(pairs[1][0], 1)
+    assert_equal(pairs[2][0], 2)
+    ```
+    """
+
+    comptime IteratorType[
+        iterable_mut: Bool, //, iterable_origin: Origin[mut=iterable_mut]
+    ]: Iterator = Self
+    """The iterator type for this grapheme indices iterator.
+
+    Parameters:
+        iterable_mut: Whether the iterable is mutable.
+        iterable_origin: The origin of the iterable.
+    """
+
+    comptime Element = Tuple[Int, StringSlice[Self.origin]]
+    """The element type yielded by iteration."""
+
+    var _inner: GraphemeSliceIter[Self.origin]
+    """Underlying grapheme slice iterator."""
+
+    var _byte_offset: Int
+    """Running byte offset of the next grapheme, relative to the original
+    string."""
+
+    @doc_hidden
+    def __init__(out self, str_slice: StringSlice[Self.origin]):
+        self._inner = GraphemeSliceIter(str_slice)
+        self._byte_offset = 0
+
+    def __iter__(ref self) -> Self.IteratorType[origin_of(self)]:
+        """Iterate over the grapheme indices in the underlying string slice.
+
+        Returns:
+            An iterator yielding `(byte_offset, grapheme)` pairs.
+        """
+        return self.copy()
+
+    @always_inline
+    def __next__(
+        mut self,
+    ) raises StopIteration -> Tuple[Int, StringSlice[Self.origin]]:
+        """Get the next `(byte_offset, grapheme)` pair.
+
+        Returns:
+            The byte offset at which the next grapheme starts and the
+            grapheme slice itself.
+
+        Raises:
+            `StopIteration` if the iterator has been exhausted.
+        """
+        var g = self._inner.next()
+        if not g:
+            raise StopIteration()
+        var offset = self._byte_offset
+        self._byte_offset += g.unsafe_value().byte_length()
+        return (offset, g.unsafe_value())

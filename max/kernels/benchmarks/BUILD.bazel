@@ -68,6 +68,10 @@ _EXTRA_CONSTRAINTS = {
         "//:apple_gpu": ["@platforms//:incompatible"],
         "//conditions:default": [],
     }),  # FIXME: MOCO-3161
+    "gpu/nn/bench_fp8_index.mojo": select({
+        "//:apple_gpu": ["@platforms//:incompatible"],
+        "//conditions:default": [],
+    }),  # Kernel uses NVIDIA SM90 TMA primitives; Metal AIR codegen crashes.
     "gpu/nn/bench_conv2d_sm100.mojo": ["//:b200_gpu"],  # SM100-specific TMA im2col
     "gpu/linalg/bench_block_scaled_matmul.mojo": ["//:b200_gpu"],  # SM100-specific block-scaled matmul
     "gpu/nn/bench_moe_routing.mojo": select({
@@ -175,7 +179,11 @@ _CPU_TESTS = glob(
     )
     for src in glob(
         ["gpu/**/*.mojo"],
-        exclude = ["gpu/nn/bench_conv3d.mojo"],
+        exclude = [
+            "gpu/nn/bench_conv2d.mojo",
+            "gpu/layout/bench_tile_io_copy.mojo",
+            "gpu/nn/bench_conv3d.mojo",
+        ],
     )
 ]
 
@@ -187,7 +195,11 @@ _CPU_TESTS = glob(
     )
     for src in glob(
         ["gpu/**/*.mojo"],
-        exclude = ["gpu/nn/bench_conv3d.mojo"],
+        exclude = [
+            "gpu/nn/bench_conv2d.mojo",
+            "gpu/layout/bench_tile_io_copy.mojo",
+            "gpu/nn/bench_conv3d.mojo",
+        ],
     )
 ]
 
@@ -210,6 +222,46 @@ mojo_test(
         "//max:internal_utils",
         "//max:layout",
         "//max:nn",
+        "@mojo//:std",
+    ],
+)
+
+mojo_test(
+    name = "gpu/nn/bench_conv2d.mojo.run",
+    size = "enormous",
+    srcs = ["gpu/nn/bench_conv2d.mojo"],
+    enable_assertions = False,
+    exec_properties = {
+        "test.resources:gpu-memory": "6",
+    },
+    tags = [
+        "gpu",
+        "manual",
+    ],
+    target_compatible_with = ["//:b200_gpu"],
+    deps = [
+        "//max:internal_utils",
+        "//max:layout",
+        "//max:nn",
+        "@mojo//:std",
+    ],
+)
+
+mojo_test(
+    name = "gpu/layout/bench_tile_io_copy.mojo.run",
+    size = "enormous",
+    srcs = ["gpu/layout/bench_tile_io_copy.mojo"],
+    enable_assertions = False,
+    exec_properties = {
+        "test.resources:gpu-memory": "1",
+    },
+    tags = [
+        "gpu",
+        "manual",
+    ],
+    target_compatible_with = ["//:has_gpu"],
+    deps = [
+        "//max:layout",
         "@mojo//:std",
     ],
 )

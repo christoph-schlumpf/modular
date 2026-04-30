@@ -53,7 +53,7 @@ from std.sys.defines import _is_bool_like
 from std.reflection import call_location, SourceLocation
 from std.builtin.device_passable import DevicePassable
 from std.compile.compile import CompiledFunctionInfo
-from std.reflection import get_linkage_name, get_type_name
+from std.reflection import get_linkage_name, reflect
 from std.gpu.host.compile import (
     _compile_code,
     _cross_compilation,
@@ -886,7 +886,7 @@ struct DeviceBuffer[dtype: DType](
         comptime assert not is_gpu(), "DeviceBuffer is not supported on GPUs"
         comptime elem_size = size_of[Self.dtype]()
         var cpp_handle: _DeviceBufferPtr[mut=True] = {}
-        var device_ptr = Self._DevicePtr(_unsafe_null=())
+        var device_ptr: Optional[Self._DevicePtr] = {}
 
         # TODO: Remove this if statement.
         # As of GEX-3005, Driver only supports async allocation. For
@@ -898,13 +898,6 @@ struct DeviceBuffer[dtype: DType](
                 external_call[
                     "AsyncRT_DeviceContext_createBuffer_async",
                     _CString[],
-                    UnsafePointer[
-                        _DeviceBufferPtr[mut=True], origin_of(cpp_handle)
-                    ],
-                    UnsafePointer[Self._DevicePtr, origin_of(device_ptr)],
-                    _DeviceContextPtr[mut=True],
-                    c_size_t,
-                    c_size_t,
                 ](
                     UnsafePointer(to=cpp_handle),
                     UnsafePointer(to=device_ptr),
@@ -921,7 +914,7 @@ struct DeviceBuffer[dtype: DType](
                 ")",
             )
 
-        self._device_ptr = device_ptr
+        self._device_ptr = device_ptr.value()
         self._handle = cpp_handle
 
     @doc_hidden
@@ -1067,7 +1060,7 @@ struct DeviceBuffer[dtype: DType](
     def empty(context: DeviceContext) -> Self:
         return Self(
             context,
-            Self._DevicePtr(_unsafe_null=()),
+            Self._DevicePtr.unsafe_dangling(),
             0,
             owning=False,
         )
@@ -1116,9 +1109,9 @@ struct DeviceBuffer[dtype: DType](
         comptime assert not is_gpu(), "DeviceBuffer is not supported on GPUs"
         comptime elem_size = size_of[view_type]()
         var new_handle: _DeviceBufferPtr[mut=True] = {}
-        var new_device_ptr = UnsafePointer[Scalar[view_type], MutAnyOrigin](
-            _unsafe_null=()
-        )
+        var new_device_ptr: Optional[
+            UnsafePointer[Scalar[view_type], MutAnyOrigin]
+        ] = {}
         # const char *AsyncRT_DeviceBuffer_createSubBuffer(
         #     const DeviceBuffer **result, void **device_ptr,
         #     const DeviceBuffer *buf, size_t offset, size_t len, size_t elem_size)
@@ -1126,17 +1119,6 @@ struct DeviceBuffer[dtype: DType](
             external_call[
                 "AsyncRT_DeviceBuffer_createSubBuffer",
                 _CString[],
-                UnsafePointer[
-                    _DeviceBufferPtr[mut=True], origin_of(new_handle)
-                ],
-                UnsafePointer[
-                    UnsafePointer[Scalar[view_type], MutAnyOrigin],
-                    origin_of(new_device_ptr),
-                ],
-                _DeviceBufferPtr[mut=True],
-                c_size_t,
-                c_size_t,
-                c_size_t,
             ](
                 UnsafePointer(to=new_handle),
                 UnsafePointer(to=new_device_ptr),
@@ -1147,7 +1129,7 @@ struct DeviceBuffer[dtype: DType](
             ),
             location=call_location(),
         )
-        return DeviceBuffer[view_type](new_handle, new_device_ptr)
+        return DeviceBuffer[view_type](new_handle, new_device_ptr.value())
 
     def enqueue_copy_to(self, dst: DeviceBuffer[Self.dtype, ...]) raises:
         """Enqueues an asynchronous copy from this buffer to another device buffer.
@@ -1466,8 +1448,18 @@ struct DeviceBuffer[dtype: DType](
             abort(t"failed to write DeviceBuffer:{e}")
 
 
+trait _FunctionEnqueuer:
+    """Trait for contexts (DeviceContext or DeviceStream) that can enqueue device functions.
+    """
+
+    comptime enqueue_fn_name: StaticString
+
+    def handle(self) -> UnsafePointer[NoneType, MutExternalOrigin]:
+        ...
+
+
 @doc_hidden
-struct DeviceStream(ImplicitlyCopyable):
+struct DeviceStream(ImplicitlyCopyable, _FunctionEnqueuer):
     """Represents a CUDA/HIP stream for asynchronous GPU operations.
 
     A DeviceStream provides a queue for GPU operations that can execute concurrently
@@ -1493,8 +1485,22 @@ struct DeviceStream(ImplicitlyCopyable):
     ```
     """
 
+    comptime enqueue_fn_name: StaticString = (
+        "AsyncRT_DeviceStream_enqueueFunctionDirect"
+    )
+    """C runtime function name for enqueueing a device function on this stream."""
+
     var _handle: _DeviceStreamPtr[mut=True]
     """Internal handle to the native stream object."""
+
+    @always_inline
+    def handle(self) -> UnsafePointer[NoneType, MutExternalOrigin]:
+        """Get underlying handle.
+
+        Returns:
+            The underlying C context handle as an opaque pointer.
+        """
+        return self._handle.value().bitcast[NoneType]()
 
     @doc_hidden
     @always_inline
@@ -1723,61 +1729,6 @@ struct DeviceStream(ImplicitlyCopyable):
             block_dim, location=call_location()
         )
 
-        self._enqueue_function(
-            f,
-            *args,
-            grid_dim=grid_dim,
-            block_dim=block_dim,
-            cluster_dim=cluster_dim,
-            shared_mem_bytes=shared_mem_bytes,
-            attributes=attributes^,
-            constant_memory=constant_memory^,
-        )
-
-    @parameter
-    @always_inline
-    def _enqueue_function_unchecked[
-        *Ts: AnyType
-    ](
-        self,
-        f: DeviceFunction,
-        *args: *Ts,
-        grid_dim: Dim,
-        block_dim: Dim,
-        cluster_dim: OptionalReg[Dim] = None,
-        shared_mem_bytes: OptionalReg[Int] = None,
-        var attributes: List[LaunchAttribute] = [],
-        var constant_memory: List[ConstantMemoryMapping] = [],
-        location: OptionalReg[SourceLocation] = None,
-    ) raises:
-        f._call_with_pack(
-            self,
-            *args,
-            grid_dim=grid_dim,
-            block_dim=block_dim,
-            cluster_dim=cluster_dim,
-            shared_mem_bytes=shared_mem_bytes,
-            attributes=attributes^,
-            constant_memory=constant_memory^,
-            location=location.or_else(call_location()),
-        )
-
-    @parameter
-    @always_inline
-    def _enqueue_function[
-        *Ts: DevicePassable
-    ](
-        self,
-        f: DeviceFunction,
-        *args: *Ts,
-        grid_dim: Dim,
-        block_dim: Dim,
-        cluster_dim: OptionalReg[Dim] = None,
-        shared_mem_bytes: OptionalReg[Int] = None,
-        var attributes: List[LaunchAttribute] = [],
-        var constant_memory: List[ConstantMemoryMapping] = [],
-        location: OptionalReg[SourceLocation] = None,
-    ) raises:
         f._call_with_pack_checked(
             self,
             *args,
@@ -1787,7 +1738,7 @@ struct DeviceStream(ImplicitlyCopyable):
             shared_mem_bytes=shared_mem_bytes,
             attributes=attributes^,
             constant_memory=constant_memory^,
-            location=location.or_else(call_location()),
+            location=call_location(),
         )
 
 
@@ -2315,13 +2266,15 @@ struct DeviceFunction[
             else:
                 print(llvm)
 
+    # Enqueue function on a stream
     @always_inline
     @parameter
     def _call_with_pack[
-        *Ts: AnyType
+        *Ts: AnyType,
+        ContextT: _FunctionEnqueuer,
     ](
         read self,
-        ctx: DeviceContext,
+        ctx: ContextT,
         *args: *Ts,
         grid_dim: Dim,
         block_dim: Dim,
@@ -2332,7 +2285,7 @@ struct DeviceFunction[
         location: OptionalReg[SourceLocation] = None,
     ) raises:
         comptime num_args = Ts.size
-        var num_captures = self._func_impl.num_captures
+        var num_captures = max(0, self._func_impl.num_captures)
         comptime populate = type_of(self._func_impl).populate
         comptime num_captures_static = 16
 
@@ -2375,9 +2328,6 @@ struct DeviceFunction[
         comptime for i in range(num_args):
             _populate_arg_sizes[i]()
 
-        for i in range(num_captures):
-            dense_args_sizes[num_args + i] = self._func_impl.capture_sizes[i]
-
         if cluster_dim:
             attributes.append(
                 LaunchAttribute.from_cluster_dim(cluster_dim.value())
@@ -2386,14 +2336,11 @@ struct DeviceFunction[
         for i in range(len(constant_memory)):
             self._copy_to_constant_memory(constant_memory[i])
 
-        # const char *AsyncRT_DeviceContext_enqueueFunctionDirect(
-        #     const DeviceContext *ctx, const DeviceFunction *func,
-        #     uint32_t gridX, uint32_t gridY, uint32_t gridZ,
-        #     uint32_t blockX, uint32_t blockY, uint32_t blockZ,
-        #     uint32_t sharedMemBytes, void *attrs, uint32_t num_attrs,
-        #     void **args, const size_t *argSizes)
-
         if num_captures > 0:
+            for i in range(num_captures):
+                dense_args_sizes[num_args + i] = self._func_impl.capture_sizes[
+                    i
+                ]
             # Call the populate function to initialize the captured values in the arguments array.
             # The captured values are always at the end of the argument list.
             # This function (generated by the compiler) has to be inlined here
@@ -2405,203 +2352,30 @@ struct DeviceFunction[
             var capture_args_start = dense_args_addrs + num_args
             populate(capture_args_start.bitcast[NoneType]())
 
-            _checked_call[Self.func](
-                external_call[
-                    "AsyncRT_DeviceContext_enqueueFunctionDirect",
-                    _CString[],
-                    _DeviceContextPtr[mut=True],
-                    _DeviceFunctionPtr[mut=True],
-                    UInt32,
-                    UInt32,
-                    UInt32,
-                    UInt32,
-                    UInt32,
-                    UInt32,
-                    UInt32,
-                    UnsafePointer[LaunchAttribute, MutAnyOrigin],
-                    UInt32,
-                    UnsafePointer[OpaquePointer[MutAnyOrigin], MutAnyOrigin],
-                    UInt32,
-                    UnsafePointer[UInt64, MutAnyOrigin],
-                ](
-                    ctx._handle,
-                    self._handle,
-                    UInt32(grid_dim.x()),
-                    UInt32(grid_dim.y()),
-                    UInt32(grid_dim.z()),
-                    UInt32(block_dim.x()),
-                    UInt32(block_dim.y()),
-                    UInt32(block_dim.z()),
-                    UInt32(shared_mem_bytes.or_else(0)),
-                    attributes.unsafe_ptr(),
-                    UInt32(len(attributes)),
-                    dense_args_addrs,
-                    UInt32(num_args + num_captures),
-                    dense_args_sizes,
-                ),
-                device_context=self._context,
-                location=location.or_else(call_location()),
-            )
-        else:
-            _checked_call[Self.func](
-                external_call[
-                    "AsyncRT_DeviceContext_enqueueFunctionDirect",
-                    _CString[],
-                    _DeviceContextPtr[mut=True],
-                    _DeviceFunctionPtr[mut=True],
-                    UInt32,
-                    UInt32,
-                    UInt32,
-                    UInt32,
-                    UInt32,
-                    UInt32,
-                    UInt32,
-                    UnsafePointer[LaunchAttribute, MutAnyOrigin],
-                    UInt32,
-                    UnsafePointer[OpaquePointer[MutAnyOrigin], MutAnyOrigin],
-                    UInt32,
-                    UnsafePointer[UInt64, MutAnyOrigin],
-                ](
-                    ctx._handle,
-                    self._handle,
-                    UInt32(grid_dim.x()),
-                    UInt32(grid_dim.y()),
-                    UInt32(grid_dim.z()),
-                    UInt32(block_dim.x()),
-                    UInt32(block_dim.y()),
-                    UInt32(block_dim.z()),
-                    UInt32(shared_mem_bytes.or_else(0)),
-                    attributes.unsafe_ptr(),
-                    UInt32(len(attributes)),
-                    dense_args_addrs,
-                    UInt32(num_args),
-                    dense_args_sizes,
-                ),
-                device_context=self._context,
-                location=location.or_else(call_location()),
-            )
+        _checked_call[Self.func](
+            external_call[ContextT.enqueue_fn_name, _CString[]](
+                ctx.handle(),
+                self._handle,
+                grid_dim.x(),
+                grid_dim.y(),
+                grid_dim.z(),
+                block_dim.x(),
+                block_dim.y(),
+                block_dim.z(),
+                shared_mem_bytes.or_else(0),
+                attributes.unsafe_ptr(),
+                len(attributes),
+                dense_args_addrs,
+                UInt32(num_args + num_captures),
+                dense_args_sizes,
+            ),
+            device_context=self._context,
+            location=location.or_else(call_location()),
+        )
 
         if num_captures > num_captures_static:
             dense_args_addrs.free()
             dense_args_sizes.free()
-
-    # Enqueue function on a stream
-    @always_inline
-    @parameter
-    def _call_with_pack[
-        *Ts: AnyType
-    ](
-        read self,
-        stream: DeviceStream,
-        *args: *Ts,
-        grid_dim: Dim,
-        block_dim: Dim,
-        cluster_dim: OptionalReg[Dim] = None,
-        shared_mem_bytes: OptionalReg[Int] = None,
-        var attributes: List[LaunchAttribute] = [],
-        var constant_memory: List[ConstantMemoryMapping] = [],
-        location: OptionalReg[SourceLocation] = None,
-    ) raises:
-        comptime num_args = Ts.size
-        var num_captures = self._func_impl.num_captures
-        comptime populate = type_of(self._func_impl).populate
-        comptime num_captures_static = 16
-
-        # NOTE: Manual short buffer optimization. We could use a
-        # Variant[List, InlineArray] instead, but it would look a lot more
-        # verbose. This way, however, we need to conditionally free at the end.
-        var dense_args_addrs: UnsafePointer[
-            OpaquePointer[MutAnyOrigin], MutAnyOrigin
-        ]
-        if num_captures > num_captures_static:
-            dense_args_addrs = alloc[OpaquePointer[MutAnyOrigin]](
-                num_captures + num_args
-            )
-        else:
-            dense_args_addrs = stack_allocation[
-                num_captures_static + num_args, OpaquePointer[MutAnyOrigin]
-            ]()
-
-        comptime for i in range(num_args):
-            # TODO(MSTDL-1904): Validate the safety of this.
-            dense_args_addrs[i] = (
-                UnsafePointer(to=args[i])
-                .bitcast[NoneType]()
-                .unsafe_mut_cast[True]()
-            )
-
-        if cluster_dim:
-            attributes.append(
-                LaunchAttribute.from_cluster_dim(cluster_dim.value())
-            )
-
-        for i in range(len(constant_memory)):
-            self._copy_to_constant_memory(constant_memory[i])
-
-        # const char *AsyncRT_DeviceContext_enqueueFunctionDirect(
-        #     const DeviceContext *ctx, const DeviceFunction *func,
-        #     uint32_t gridX, uint32_t gridY, uint32_t gridZ,
-        #     uint32_t blockX, uint32_t blockY, uint32_t blockZ,
-        #     uint32_t sharedMemBytes, void *attrs, uint32_t num_attrs,
-        #     void **args)
-
-        if num_captures > 0:
-            # Call the populate function to initialize the captured values in the arguments array.
-            # The captured values are always at the end of the argument list.
-            # This function (generated by the compiler) has to be inlined here
-            # and be in the same scope as the user of dense_args_addr
-            # (i.e. the following external_call).
-            # Because this closure uses stack allocated ptrs
-            # to store the captured values in dense_args_addrs, they need to
-            # not go out of the scope before dense_args_addr is being use.
-            var capture_args_start = dense_args_addrs + num_args
-            populate(capture_args_start.bitcast[NoneType]())
-            _checked_call[Self.func](
-                external_call[
-                    "AsyncRT_DeviceStream_enqueueFunctionDirect",
-                    _CString[],
-                ](
-                    stream,
-                    self._handle,
-                    grid_dim.x(),
-                    grid_dim.y(),
-                    grid_dim.z(),
-                    block_dim.x(),
-                    block_dim.y(),
-                    block_dim.z(),
-                    shared_mem_bytes.or_else(0),
-                    attributes.unsafe_ptr(),
-                    len(attributes),
-                    dense_args_addrs,
-                ),
-                device_context=self._context,
-                location=location.or_else(call_location()),
-            )
-        else:
-            _checked_call[Self.func](
-                external_call[
-                    "AsyncRT_DeviceStream_enqueueFunctionDirect",
-                    _CString[],
-                ](
-                    stream,
-                    self._handle,
-                    grid_dim.x(),
-                    grid_dim.y(),
-                    grid_dim.z(),
-                    block_dim.x(),
-                    block_dim.y(),
-                    block_dim.z(),
-                    shared_mem_bytes.or_else(0),
-                    attributes.unsafe_ptr(),
-                    len(attributes),
-                    dense_args_addrs,
-                ),
-                device_context=self._context,
-                location=location.or_else(call_location()),
-            )
-
-        if num_captures > num_captures_static:
-            dense_args_addrs.free()
 
     @always_inline
     @staticmethod
@@ -2638,7 +2412,7 @@ struct DeviceFunction[
                         declared_arg_type, DevicePassable
                     ].get_type_name()
                 else:
-                    return get_type_name[declared_arg_type]()
+                    return reflect[declared_arg_type]().name()
 
             # Now we'll check if the given argument's device_type is
             # what the kernel expects.
@@ -2691,130 +2465,11 @@ struct DeviceFunction[
     @always_inline
     @parameter
     def _call_with_pack_checked[
-        *Ts: DevicePassable
+        *Ts: DevicePassable,
+        ContextT: _FunctionEnqueuer,
     ](
         read self,
-        stream: DeviceStream,
-        *args: *Ts,
-        grid_dim: Dim,
-        block_dim: Dim,
-        cluster_dim: OptionalReg[Dim] = None,
-        shared_mem_bytes: OptionalReg[Int] = None,
-        var attributes: List[LaunchAttribute] = [],
-        var constant_memory: List[ConstantMemoryMapping] = [],
-        location: OptionalReg[SourceLocation] = None,
-    ) raises:
-        comptime num_args = Ts.size
-        var num_captures = self._func_impl.num_captures
-        comptime populate = type_of(self._func_impl).populate
-        comptime num_captures_static = 16
-
-        comptime if Self.declared_arg_types:
-            _ = Self._validate_arguments[*Ts, num_args=num_args]()
-
-        # NOTE: Manual short buffer optimization. We could use a
-        # Variant[List, InlineArray] instead, but it would look a lot more
-        # verbose. This way, however, we need to conditionally free at the end.
-        var dense_args_addrs: UnsafePointer[
-            OpaquePointer[MutAnyOrigin], MutAnyOrigin
-        ]
-        if num_captures > num_captures_static:
-            dense_args_addrs = alloc[OpaquePointer[MutAnyOrigin]](
-                num_captures + num_args
-            )
-        else:
-            dense_args_addrs = stack_allocation[
-                num_captures_static + num_args, OpaquePointer[MutAnyOrigin]
-            ]()
-
-        comptime for i in range(num_args):
-            # TODO(MSTDL-1904): Validate the safety of this.
-            dense_args_addrs[i] = (
-                UnsafePointer(to=args[i])
-                .bitcast[NoneType]()
-                .unsafe_mut_cast[True]()
-            )
-
-        if cluster_dim:
-            attributes.append(
-                LaunchAttribute.from_cluster_dim(cluster_dim.value())
-            )
-
-        for i in range(len(constant_memory)):
-            self._copy_to_constant_memory(constant_memory[i])
-
-        # const char *AsyncRT_DeviceContext_enqueueFunctionDirect(
-        #     const DeviceContext *ctx, const DeviceFunction *func,
-        #     uint32_t gridX, uint32_t gridY, uint32_t gridZ,
-        #     uint32_t blockX, uint32_t blockY, uint32_t blockZ,
-        #     uint32_t sharedMemBytes, void *attrs, uint32_t num_attrs,
-        #     void **args)
-
-        if num_captures > 0:
-            # Call the populate function to initialize the captured values in the arguments array.
-            # The captured values are always at the end of the argument list.
-            # This function (generated by the compiler) has to be inlined here
-            # and be in the same scope as the user of dense_args_addr
-            # (i.e. the following external_call).
-            # Because this closure uses stack allocated ptrs
-            # to store the captured values in dense_args_addrs, they need to
-            # not go out of the scope before dense_args_addr is being use.
-            var capture_args_start = dense_args_addrs + num_args
-            populate(capture_args_start.bitcast[NoneType]())
-            _checked_call[Self.func](
-                external_call[
-                    "AsyncRT_DeviceStream_enqueueFunctionDirect",
-                    _CString[],
-                ](
-                    stream,
-                    self._handle,
-                    grid_dim.x(),
-                    grid_dim.y(),
-                    grid_dim.z(),
-                    block_dim.x(),
-                    block_dim.y(),
-                    block_dim.z(),
-                    shared_mem_bytes.or_else(0),
-                    attributes.unsafe_ptr(),
-                    len(attributes),
-                    dense_args_addrs,
-                ),
-                device_context=self._context,
-                location=location.or_else(call_location()),
-            )
-        else:
-            _checked_call[Self.func](
-                external_call[
-                    "AsyncRT_DeviceStream_enqueueFunctionDirect",
-                    _CString[],
-                ](
-                    stream,
-                    self._handle,
-                    grid_dim.x(),
-                    grid_dim.y(),
-                    grid_dim.z(),
-                    block_dim.x(),
-                    block_dim.y(),
-                    block_dim.z(),
-                    shared_mem_bytes.or_else(0),
-                    attributes.unsafe_ptr(),
-                    len(attributes),
-                    dense_args_addrs,
-                ),
-                device_context=self._context,
-                location=location.or_else(call_location()),
-            )
-
-        if num_captures > num_captures_static:
-            dense_args_addrs.free()
-
-    @always_inline
-    @parameter
-    def _call_with_pack_checked[
-        *Ts: DevicePassable
-    ](
-        read self,
-        ctx: DeviceContext,
+        ctx: ContextT,
         *args: *Ts,
         grid_dim: Dim,
         block_dim: Dim,
@@ -2842,7 +2497,7 @@ struct DeviceFunction[
             num_translated_args = validated_args[0]
             translated_arg_offsets = validated_args[1].copy()
 
-        var num_captures = self._func_impl.num_captures
+        var num_captures = max(0, self._func_impl.num_captures)
         comptime populate = type_of(self._func_impl).populate
         comptime num_captures_static = 16
 
@@ -2865,7 +2520,7 @@ struct DeviceFunction[
         # Space to store the arguments to the kernel that have been converted
         # from host dtype to device dtype.
         var translated_args = InlineArray[Byte, args_size](uninitialized=True)
-        var start_addr = UInt(Int(translated_args.unsafe_ptr()))
+        var start_addr = Int(translated_args.unsafe_ptr())
         var extra_align = align_up(start_addr, 8) - start_addr
 
         # NOTE: Manual short buffer optimization. We could use a
@@ -2892,8 +2547,9 @@ struct DeviceFunction[
             ]()
             for i in range(num_captures_static + num_passed_args):
                 dense_args_sizes[i] = 0
+
         # Since we skip over zero sized declared dtypes when passing arguments
-        # we need to know the current count arguments pushed.
+        # we need to know the current count of arguments pushed.
         var translated_arg_idx = 0
 
         comptime for i in range(num_passed_args):
@@ -2904,7 +2560,7 @@ struct DeviceFunction[
                 comptime actual_arg_type = Ts[i]
                 var first_word_addr = UnsafePointer(
                     to=translated_args.unsafe_ptr()[
-                        translated_arg_offset + Int(extra_align)
+                        translated_arg_offset + extra_align
                     ]
                 ).bitcast[NoneType]()
                 args[i]._to_device_type(first_word_addr)
@@ -2913,11 +2569,6 @@ struct DeviceFunction[
                     size_of[actual_arg_type.device_type]()
                 )
                 translated_arg_idx += 1
-
-        for i in range(num_captures):
-            dense_args_sizes[
-                num_passed_args + i
-            ] = self._func_impl.capture_sizes[i]
 
         if cluster_dim:
             attributes.append(
@@ -2928,13 +2579,11 @@ struct DeviceFunction[
             for i in range(len(constant_memory)):
                 self._copy_to_constant_memory(constant_memory[i])
 
-        # const char *AsyncRT_DeviceContext_enqueueFunctionDirect(const DeviceContext *ctx, const DeviceFunction *func,
-        #                                                         uint32_t gridX, uint32_t gridY, uint32_t gridZ,
-        #                                                         uint32_t blockX, uint32_t blockY, uint32_t blockZ,
-        #                                                         uint32_t sharedMemBytes, void *attrs, uint32_t num_attrs,
-        #                                                         void **args)
-
         if num_captures > 0:
+            for i in range(num_captures):
+                dense_args_sizes[
+                    num_passed_args + i
+                ] = self._func_impl.capture_sizes[i]
             # Call the populate function to initialize the captured values in the arguments array.
             # The captured values are always at the end of the argument list.
             # This function (generated by the compiler) has to be inlined here
@@ -2947,35 +2596,18 @@ struct DeviceFunction[
             populate(capture_args_start.bitcast[NoneType]())
 
         _checked_call[Self.func](
-            external_call[
-                "AsyncRT_DeviceContext_enqueueFunctionDirect",
-                _CString[],
-                _DeviceContextPtr[mut=True],
-                _DeviceFunctionPtr[mut=True],
-                UInt32,
-                UInt32,
-                UInt32,
-                UInt32,
-                UInt32,
-                UInt32,
-                UInt32,
-                UnsafePointer[LaunchAttribute, MutAnyOrigin],
-                UInt32,
-                UnsafePointer[OpaquePointer[MutAnyOrigin], MutAnyOrigin],
-                UInt32,
-                UnsafePointer[UInt64, MutAnyOrigin],
-            ](
-                ctx._handle,
+            external_call[ContextT.enqueue_fn_name, _CString[]](
+                ctx.handle(),
                 self._handle,
-                UInt32(grid_dim.x()),
-                UInt32(grid_dim.y()),
-                UInt32(grid_dim.z()),
-                UInt32(block_dim.x()),
-                UInt32(block_dim.y()),
-                UInt32(block_dim.z()),
-                UInt32(shared_mem_bytes.or_else(0)),
+                grid_dim.x(),
+                grid_dim.y(),
+                grid_dim.z(),
+                block_dim.x(),
+                block_dim.y(),
+                block_dim.z(),
+                shared_mem_bytes.or_else(0),
                 attributes.unsafe_ptr(),
-                UInt32(len(attributes)),
+                len(attributes),
                 dense_args_addrs,
                 UInt32(num_translated_args + num_captures),
                 dense_args_sizes,
@@ -3380,7 +3012,7 @@ struct DeviceExternalFunction:
         return Int(result)
 
 
-struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
+struct DeviceContext(ImplicitlyCopyable, RegisterPassable, _FunctionEnqueuer):
     """Represents a single stream of execution on a particular accelerator
     (GPU).
 
@@ -3421,11 +3053,25 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
     ```
     """
 
+    comptime enqueue_fn_name: StaticString = (
+        "AsyncRT_DeviceContext_enqueueFunctionDirect"
+    )
+    """C runtime function name for enqueueing a device function on this context."""
+
     comptime default_device_info = GPUInfo.from_name[_accelerator_arch()]()
     """`GPUInfo` object for the default accelerator."""
 
     var _handle: _DeviceContextPtr[mut=True]
     var _owning: Bool
+
+    @always_inline
+    def handle(self) -> UnsafePointer[NoneType, MutExternalOrigin]:
+        """Get underlying handle.
+
+        Returns:
+            The underlying C context handle as an opaque pointer.
+        """
+        return self._handle.value().bitcast[NoneType]()
 
     @always_inline
     def __init__(
@@ -4338,8 +3984,8 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
             _ptxas_info_verbose=_ptxas_info_verbose,
         ](func_attribute=func_attribute)
 
-        self._enqueue_function_unchecked(
-            gpu_kernel,
+        gpu_kernel._call_with_pack(
+            self,
             *args,
             grid_dim=grid_dim,
             block_dim=block_dim,
@@ -4436,8 +4082,8 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
         comptime assert (
             not f.declared_arg_types
         ), "A checked DeviceFunction should be called with `enqueue_function`."
-        self._enqueue_function_unchecked(
-            f,
+        f._call_with_pack(
+            self,
             *args,
             grid_dim=grid_dim,
             block_dim=block_dim,
@@ -4512,8 +4158,8 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
         comptime assert Bool(
             f.declared_arg_types
         ), "Calling a non-checked function."
-        self._enqueue_function(
-            f,
+        f._call_with_pack_checked(
+            self,
             *args,
             grid_dim=grid_dim,
             block_dim=block_dim,
@@ -4600,8 +4246,8 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
             block_dim, location=call_location()
         )
 
-        self._enqueue_external_function(
-            f,
+        f._call_with_pack(
+            self,
             *args,
             grid_dim=grid_dim,
             block_dim=block_dim,
@@ -4734,8 +4380,8 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
             _ptxas_info_verbose=_ptxas_info_verbose,
         ](func_attribute=inferred_func_attribute)
 
-        self._enqueue_function(
-            gpu_kernel,
+        gpu_kernel._call_with_pack_checked(
+            self,
             *args,
             grid_dim=grid_dim,
             block_dim=block_dim,
@@ -4861,8 +4507,8 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
             _ptxas_info_verbose=_ptxas_info_verbose,
         ](func_attribute=inferred_func_attribute)
 
-        self._enqueue_function(
-            gpu_kernel,
+        gpu_kernel._call_with_pack_checked(
+            self,
             *args,
             grid_dim=grid_dim,
             block_dim=block_dim,
@@ -4995,8 +4641,8 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
             _ptxas_info_verbose=_ptxas_info_verbose,
         ](func_attribute=inferred_func_attribute)
 
-        self._enqueue_function(
-            gpu_kernel,
+        gpu_kernel._call_with_pack_checked(
+            self,
             *args,
             grid_dim=grid_dim,
             block_dim=block_dim,
@@ -5233,8 +4879,8 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
             _ptxas_info_verbose=_ptxas_info_verbose,
         ](func_attribute=inferred_func_attribute)
 
-        self._enqueue_function(
-            gpu_kernel,
+        gpu_kernel._call_with_pack_checked(
+            self,
             *args,
             grid_dim=grid_dim,
             block_dim=block_dim,
@@ -5328,8 +4974,8 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
         comptime assert Bool(
             f.declared_arg_types
         ), "Calling a non-checked function."
-        self._enqueue_function(
-            f,
+        f._call_with_pack_checked(
+            self,
             *args,
             grid_dim=grid_dim,
             block_dim=block_dim,
@@ -5518,89 +5164,6 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
 
     @parameter
     @always_inline
-    def _enqueue_function_unchecked[
-        *Ts: AnyType
-    ](
-        self,
-        f: DeviceFunction,
-        *args: *Ts,
-        grid_dim: Dim,
-        block_dim: Dim,
-        cluster_dim: OptionalReg[Dim] = None,
-        shared_mem_bytes: OptionalReg[Int] = None,
-        var attributes: List[LaunchAttribute] = [],
-        var constant_memory: List[ConstantMemoryMapping] = [],
-        location: OptionalReg[SourceLocation] = None,
-    ) raises:
-        f._call_with_pack(
-            self,
-            *args,
-            grid_dim=grid_dim,
-            block_dim=block_dim,
-            cluster_dim=cluster_dim,
-            shared_mem_bytes=shared_mem_bytes,
-            attributes=attributes^,
-            constant_memory=constant_memory^,
-            location=location.or_else(call_location()),
-        )
-
-    @parameter
-    @always_inline
-    def _enqueue_function[
-        *Ts: DevicePassable
-    ](
-        self,
-        f: DeviceFunction,
-        *args: *Ts,
-        grid_dim: Dim,
-        block_dim: Dim,
-        cluster_dim: OptionalReg[Dim] = None,
-        shared_mem_bytes: OptionalReg[Int] = None,
-        var attributes: List[LaunchAttribute] = [],
-        var constant_memory: List[ConstantMemoryMapping] = [],
-        location: OptionalReg[SourceLocation] = None,
-    ) raises:
-        f._call_with_pack_checked(
-            self,
-            *args,
-            grid_dim=grid_dim,
-            block_dim=block_dim,
-            cluster_dim=cluster_dim,
-            shared_mem_bytes=shared_mem_bytes,
-            attributes=attributes^,
-            constant_memory=constant_memory^,
-            location=location.or_else(call_location()),
-        )
-
-    @parameter
-    @always_inline
-    def _enqueue_external_function[
-        *Ts: AnyType
-    ](
-        self,
-        f: DeviceExternalFunction,
-        *args: *Ts,
-        grid_dim: Dim,
-        block_dim: Dim,
-        cluster_dim: OptionalReg[Dim] = None,
-        shared_mem_bytes: OptionalReg[Int] = None,
-        var attributes: List[LaunchAttribute] = [],
-        var constant_memory: List[ConstantMemoryMapping] = [],
-        location: OptionalReg[SourceLocation] = None,
-    ) raises:
-        f._call_with_pack(
-            self,
-            *args,
-            grid_dim=grid_dim,
-            block_dim=block_dim,
-            cluster_dim=cluster_dim,
-            shared_mem_bytes=shared_mem_bytes,
-            attributes=attributes^,
-            constant_memory=constant_memory^,
-            location=location.or_else(call_location()),
-        )
-
-    @always_inline
     def execution_time[
         func: def(Self) raises capturing[_] -> None
     ](self, num_iters: Int) raises -> Int:
@@ -5649,7 +5212,7 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
 
     @always_inline
     def execution_time[
-        FuncType: def(Self) -> None,
+        FuncType: def(Self) raises -> None,
     ](self, func: FuncType, num_iters: Int) raises -> Int:
         """Measures the execution time of a function that takes a DeviceContext parameter.
 
@@ -5794,7 +5357,7 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
 
     @always_inline
     def execution_time[
-        FuncType: def() -> None,
+        FuncType: def() raises -> None,
     ](self, func: FuncType, num_iters: Int) raises -> Int:
         """Measures the execution time of a function over multiple iterations.
 
@@ -5887,7 +5450,7 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable):
 
     @always_inline
     def execution_time_iter[
-        FuncType: def(Self, Int) -> None,
+        FuncType: def(Self, Int) raises -> None,
     ](self, func: FuncType, num_iters: Int) raises -> Int:
         """Measures the execution time of a function that takes iteration index as input.
 
@@ -7278,19 +6841,14 @@ struct DeviceMulticastBuffer[dtype: DType]:
     ) raises -> DeviceBuffer[Self.dtype]:
         # const char* AsyncRT_DeviceMulticastBuffer_unicastBufferFor(const DeviceBuffer **result, void **devicePtr, const DeviceMulticastBuffer *multiBuffer, const DeviceContext* ctx)
         var buf_handle = _DeviceBufferPtr[mut=True]()
-        comptime _BufPtr = UnsafePointer[Scalar[Self.dtype], MutAnyOrigin]
-        var buf_ptr = _BufPtr(_unsafe_null=())
+        var buf_ptr = Optional[
+            UnsafePointer[Scalar[Self.dtype], MutAnyOrigin]
+        ]()
 
         _checked(
             external_call[
                 "AsyncRT_DeviceMulticastBuffer_unicastBufferFor",
                 _CString[],
-                UnsafePointer[
-                    _DeviceBufferPtr[mut=True], origin_of(buf_handle)
-                ],
-                UnsafePointer[_BufPtr, origin_of(buf_ptr)],
-                _DeviceMulticastBufferPtr[mut=True],
-                _DeviceContextPtr[mut=True],
             ](
                 UnsafePointer(to=buf_handle),
                 UnsafePointer(to=buf_ptr),
@@ -7299,7 +6857,7 @@ struct DeviceMulticastBuffer[dtype: DType]:
             )
         )
 
-        return DeviceBuffer[Self.dtype](buf_handle, buf_ptr)
+        return DeviceBuffer[Self.dtype](buf_handle, buf_ptr.value())
 
     @doc_hidden
     def multicast_buffer_for(
@@ -7307,19 +6865,14 @@ struct DeviceMulticastBuffer[dtype: DType]:
     ) raises -> DeviceBuffer[Self.dtype]:
         # const char* AsyncRT_DeviceMulticastBuffer_multicastBufferFor(const DeviceBuffer **result, void **devicePtr, const DeviceMulticastBuffer *multiBuffer, const DeviceContext* ctx)
         var buf_handle = _DeviceBufferPtr[mut=True]()
-        comptime _BufPtr = UnsafePointer[Scalar[Self.dtype], MutAnyOrigin]
-        var buf_ptr = _BufPtr(_unsafe_null=())
+        var buf_ptr = Optional[
+            UnsafePointer[Scalar[Self.dtype], MutAnyOrigin]
+        ]()
 
         _checked(
             external_call[
                 "AsyncRT_DeviceMulticastBuffer_multicastBufferFor",
                 _CString[],
-                UnsafePointer[
-                    _DeviceBufferPtr[mut=True], origin_of(buf_handle)
-                ],
-                UnsafePointer[_BufPtr, origin_of(buf_ptr)],
-                _DeviceMulticastBufferPtr[mut=True],
-                _DeviceContextPtr[mut=True],
             ](
                 UnsafePointer(to=buf_handle),
                 UnsafePointer(to=buf_ptr),
@@ -7328,7 +6881,7 @@ struct DeviceMulticastBuffer[dtype: DType]:
             )
         )
 
-        return DeviceBuffer[Self.dtype](buf_handle, buf_ptr)
+        return DeviceBuffer[Self.dtype](buf_handle, buf_ptr.value())
 
 
 struct _HostMappedBuffer[dtype: DType]:

@@ -11,13 +11,6 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-from std.reflection import (
-    struct_field_count,
-    struct_field_names,
-    get_type_name,
-    struct_field_types,
-)
-
 
 def show_type[T: AnyType]():
     """Displays a compile-time representation of a struct's fields and types.
@@ -46,15 +39,16 @@ def show_type[T: AnyType]():
             # └── var y: Float64
     ```
     """
-    comptime type_name = get_type_name[T]()
-    comptime field_count = struct_field_count[T]()
-    comptime field_names = struct_field_names[T]()
-    comptime field_types = struct_field_types[T]()
+    comptime r = reflect[T]()
+    comptime type_name = r.name()
+    comptime field_count = r.field_count()
+    comptime field_names = r.field_names()
+    comptime field_types = r.field_types()
     print("struct", type_name)
 
     comptime for idx in range(field_count):
         comptime field_name = field_names[idx]
-        comptime field_type = get_type_name[field_types[idx]]()
+        comptime field_type = reflect[field_types[idx]]().name()
         var intro = "├──" if idx < (field_count - 1) else "└──"
         print(intro, " var ", field_name, ": ", field_type, sep="")
 

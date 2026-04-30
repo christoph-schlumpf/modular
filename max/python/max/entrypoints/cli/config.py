@@ -191,13 +191,18 @@ def is_multiple(field_type: Any) -> bool:
     return get_origin(field_type) is list
 
 
-def get_normalized_flag_name(dataclass_field: Any, field_type: Any) -> str:
+def get_normalized_flag_names(
+    dataclass_field: Any, field_type: Any
+) -> tuple[str, ...]:
     normalized_name = dataclass_field.name.lower().replace("_", "-")
 
+    if dataclass_field.name == "model_path":
+        return ("--model", "--model-path", dataclass_field.name)
+
     if is_flag(field_type):
-        return f"--{normalized_name}/--no-{normalized_name}"
-    else:
-        return f"--{normalized_name}"
+        return (f"--{normalized_name}/--no-{normalized_name}",)
+
+    return (f"--{normalized_name}",)
 
 
 def create_click_option(
@@ -210,7 +215,7 @@ def create_click_option(
 
     # Get help field.
     return click.option(
-        get_normalized_flag_name(dataclass_field, field_type),
+        *get_normalized_flag_names(dataclass_field, field_type),
         show_default=False,  # Many strings include default already, and True breaks Sphinx docs
         help=help_text,
         is_flag=is_flag(field_type),
@@ -421,11 +426,11 @@ def pipeline_config_options(func: Callable[_P, _R]) -> Callable[_P, _R]:
         show_default=False,
         default="default",
         help=(
-            "Whether to run the model on CPU (--devices=cpu), GPU (--devices=gpu)"
-            " or a list of GPUs (--devices=gpu:0,1) etc. An ID value can be"
+            "Whether to run the model on CPU (``--devices=cpu``), GPU (``--devices=gpu``)"
+            " or a list of GPUs (``--devices=gpu:0,1``). An ID value can be"
             " provided optionally to indicate the device ID to target. If not"
-            " provided, the model will run on the first available GPU (--devices=gpu),"
-            " or CPU if no GPUs are available (--devices=cpu)."
+            " provided, the model will run on the first available GPU,"
+            " or CPU if no GPUs are available."
         ),
     )
     @click.option(
@@ -433,13 +438,11 @@ def pipeline_config_options(func: Callable[_P, _R]) -> Callable[_P, _R]:
         is_flag=False,
         type=DevicesOptionType(),
         show_default=False,
-        default="default",
+        default=None,
         help=(
-            "Whether to run the model on CPU (--devices=cpu), GPU (--devices=gpu)"
-            " or a list of GPUs (--devices=gpu:0,1) etc. An ID value can be"
-            " provided optionally to indicate the device ID to target. If not"
-            " provided, the model will run on the first available GPU (--devices=gpu),"
-            " or CPU if no GPUs are available (--devices=cpu)."
+            "Devices for the draft model in speculative decoding. "
+            "If not provided, inherits from ``--devices``. "
+            "Accepts the same format as ``--devices``."
         ),
     )
     @functools.wraps(func)
@@ -454,6 +457,10 @@ def pipeline_config_options(func: Callable[_P, _R]) -> Callable[_P, _R]:
         devices = kwargs.pop("devices")
         draft_devices = kwargs.pop("draft_devices")
         assert is_str_or_list_of_int(devices)
+
+        # Inherit draft_devices from devices if not explicitly specified
+        if draft_devices is None:
+            draft_devices = devices
         assert is_str_or_list_of_int(draft_devices)
 
         # Enable virtual device mode if target is set.

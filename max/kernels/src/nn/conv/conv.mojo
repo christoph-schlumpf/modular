@@ -4453,8 +4453,19 @@ def conv_gpu[
             )
             from linalg.utils import elementwise_epilogue_type
 
-            # SM100 dispatch: stride=1, dilation=1, groups=1,
-            # and channels aligned to 64 (TMA tile K alignment)
+            # SM100 dispatch: stride=1, dilation=1, groups=1, and inner
+            # C-row is 64B-aligned (TMA swizzle alignment). The dispatch
+            # picks SWIZZLE_128B when C*sizeof is 128B-aligned, otherwise
+            # SWIZZLE_64B (e.g. bf16 C_in=96 → 192 B per row).
+            #
+            # out_c (GEMM N) does NOT need MMA_N alignment: the output TMA
+            # descriptor is created with the actual out_c as its N bound, so
+            # the hardware drops OOB stores for the tail, and the filter TMA
+            # zero-fills OOB rows on load. The only remaining constraint is
+            # SIMD-pair alignment in the epilogue lambda path (the
+            # `top_col >= self.N` guard in epilogue_components.mojo fires at
+            # pair granularity, not per-element), hence
+            # `out_c * sizeof(output) % 4 == 0` (bf16: out_c % 2 == 0).
             var s = rebind[IndexList[2]](stride)
             var d = rebind[IndexList[2]](dilation)
             var in_c = input_lt.dim[input_lt.rank - 1]()
@@ -4465,8 +4476,8 @@ def conv_gpu[
                 and d[0] == 1
                 and d[1] == 1
                 and num_groups == 1
-                and in_c % 64 == 0
-                and out_c % 128 == 0
+                and (in_c * size_of[input_type]()) % 64 == 0
+                and (out_c * size_of[output_type]()) % 4 == 0
             ):
 
                 @parameter
@@ -4528,6 +4539,32 @@ def conv_gpu[
                     ]()
                 else:
                     _sm100_dispatch[]()
+                return
+
+        # SM100 im2col+matmul: route non-128-aligned channels through
+        # `_matmul_gpu` (UMMA-on-Blackwell for bf16) instead of the naive
+        # thread-per-pixel fallback.
+        comptime if _is_sm100:
+            from nn.conv.gpu.im2col_matmul_2d import (
+                dispatch_im2col_matmul_conv2d,
+            )
+
+            if dispatch_im2col_matmul_conv2d[
+                input_type,
+                filter_type,
+                output_type,
+                filter_is_fcrs,
+                maybe_epilogue_func,
+            ](
+                input,
+                filter,
+                output,
+                rebind[IndexList[2]](stride),
+                rebind[IndexList[2]](dilation),
+                rebind[IndexList[2]](symmetric_padding),
+                num_groups,
+                ctx,
+            ):
                 return
 
         # AMD RDNA 3+ dispatch: im2col + WMMA matmul for supported shapes.

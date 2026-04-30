@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import logging
 import os
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import datetime
 from pathlib import Path
 
@@ -133,7 +133,8 @@ def run_sweep(
     config: ServingBenchmarkConfig,
     *,
     uploader: SweepUploader | None = None,
-) -> None:
+    report_result: Callable[[BenchmarkRunResult], None] | None = None,
+) -> list[BenchmarkRunResult]:
     """Set up CSV + upload infrastructure and delegate benchmarking to the library.
 
     The actual range iteration, workload YAML loading, num_iters / median
@@ -148,19 +149,40 @@ def run_sweep(
             per-iteration result JSON path.  Only consulted when
             ``config.upload_results`` is True and the run is not a dry
             run.
+        report_result: Optional callback invoked once per sweep iteration as
+            soon as that iteration's :class:`BenchmarkRunResult` is
+            produced. Used by the unified ``benchmark_serving`` binary to
+            stream rows into ``utils/benchmarking/results_publication``
+            during the run rather than after — preserves "live progress"
+            visibility and ensures partial results survive a mid-sweep
+            crash.
+
+    Returns:
+        The per-iteration :class:`BenchmarkRunResult` list produced by
+        :func:`benchmark_serving.main_with_parsed_args`, so legacy callers
+        that haven't migrated to ``report_result`` can still iterate the
+        whole sweep at once.
     """
     if config.upload_results and config.cluster_information_path is None:
         logger.warning("Warning: uploading results without cluster information")
 
     # ---- Log directory ----
+    # Skip auto-creating a sweep-serving-* directory under --dry-run when
+    # the user didn't explicitly ask for one. Tests that pass --log-dir
+    # still get a real on-disk CSV.
     if config.log_dir:
         log_dir = Path(config.log_dir)
-    else:
+        os.makedirs(log_dir, exist_ok=True)
+        config.log_dir = str(log_dir)
+        print(f"Saving logs to: {log_dir}")
+    elif not config.dry_run:
         timestamp = datetime.now().strftime("%Y.%m.%d-%H.%M.%S")
         log_dir = Path(f"sweep-serving-{timestamp}")
-    os.makedirs(log_dir, exist_ok=True)
-    config.log_dir = str(log_dir)
-    print(f"Saving logs to: {log_dir}")
+        os.makedirs(log_dir, exist_ok=True)
+        config.log_dir = str(log_dir)
+        print(f"Saving logs to: {log_dir}")
+    else:
+        log_dir = None
 
     # ---- Percentiles ----
     percentiles = [
@@ -181,10 +203,25 @@ def run_sweep(
 
     upload_active = uploader is not None and config.upload_results
 
-    # ---- Run benchmarks ----
-    results = benchmark_serving_main(config)
-
     # ---- CSV output + upload ----
+    # Stream per-iteration: ``benchmark_serving_main`` yields one result per
+    # ``(max_concurrency, request_rate)`` step, and we drive CSV writes,
+    # upload side effects, and the optional ``report_result`` callback as
+    # each yields. Don't materialize the iterator here — batching at end
+    # would defeat the streaming guarantees of
+    # ``utils/benchmarking/results_publication`` (live BigQuery rows during
+    # the run + partial results surviving a mid-sweep crash).
+    results: list[BenchmarkRunResult] = []
+
+    # No log directory configured (dry-run without --log-dir): skip CSV
+    # and per-result JSON output but still drive the benchmarks.
+    if log_dir is None:
+        for result in benchmark_serving_main(config):
+            results.append(result)
+            if report_result is not None:
+                report_result(result)
+        return results
+
     results_csv_path = log_dir / "results.csv"
     writer_cls = (
         TextToImageBenchmarkResultWriter
@@ -199,9 +236,11 @@ def run_sweep(
     )
 
     with result_writer:
-        for result in results:
+        for result in benchmark_serving_main(config):
+            results.append(result)
             # When uploading, save the median iteration's JSON so the
             # uploader has something to read.
+            json_path: str | None = None
             if (
                 upload_active
                 and result.result_dict is not None
@@ -211,8 +250,8 @@ def run_sweep(
                 json_path = str(
                     log_dir / f"results-{result.max_concurrency}-median.json"
                 )
-                config.result_filename = json_path
                 save_result_json(
+                    json_path,
                     config,
                     result.result_dict,
                     result.metrics,
@@ -226,7 +265,7 @@ def run_sweep(
                 result, percentiles, is_pixel_gen=is_pixel_gen
             )
             if upload_active:
-                sweep_result.result_filename = config.result_filename
+                sweep_result.result_filename = json_path
 
             result_writer.write_row(
                 max_concurrency=result.max_concurrency,
@@ -235,10 +274,18 @@ def run_sweep(
                 result=sweep_result,
             )
 
+            # Stream the row to the results-publication reporter, if the
+            # caller wired one in. Fires here — after CSV/upload side
+            # effects, before the next iteration begins — so a crash
+            # mid-sweep still leaves rows 1..N-1 published downstream.
+            if report_result is not None:
+                report_result(result)
+
     result_file_path = results_csv_path.resolve()
     logger.info(
         f"All concurrency sweep results have been written to: {result_file_path}"
     )
+    return results
 
 
 if __name__ == "__main__":

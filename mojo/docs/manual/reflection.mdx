@@ -75,28 +75,23 @@ runtime, as long as the access itself is guided by compile-time information.
 
 The reflection calls used in the following example include:
 
-- `get_type_name[]()`: Returns the name of a type.
-- `struct_field_count[]()`, `struct_field_names[]()`, and
-  `struct_field_types[]()`: Return the count, names, and types of a struct's
-  fields.
+- `reflect[T]()`: Returns a `Reflected[T]` handle that exposes type and struct
+  introspection through methods such as `name()`, `field_count()`,
+  `field_names()`, and `field_types()`.
 
 ```mojo
-from std.reflection import (
-    struct_field_count, struct_field_names,
-    get_type_name, struct_field_types
-)
-
 def show_type[T: AnyType]():
-    comptime type_name = get_type_name[T]()
-    comptime field_count = struct_field_count[T]() # count of fields
-    comptime field_names = struct_field_names[T]() # indexed list of field names
-    comptime field_types = struct_field_types[T]() # indexed list of field types
+    comptime r = reflect[T]()
+    comptime type_name = r.name()         # name of the type
+    comptime field_count = r.field_count() # count of fields
+    comptime field_names = r.field_names() # indexed list of field names
+    comptime field_types = r.field_types() # indexed list of field types
 
     print("struct", type_name)
 
     comptime for idx in range(field_count):
         comptime field_name = field_names[idx]
-        comptime field_type = get_type_name[field_types[idx]]()
+        comptime field_type = reflect[field_types[idx]]().name()
         var intro = "├──" if idx < (field_count - 1) else "└──"
         print(intro, " var ", field_name, ": ", field_type, sep="")
 
@@ -197,12 +192,11 @@ limits copying to fields whose types conform to `Copyable`. It requires an
 already initialized target, avoiding matching values to `__init__` arguments.
 
 ```mojo
-from std.reflection import struct_field_count, struct_field_types
-
 trait MakeCopyable:
     def copy_to(self, mut other: Self):
-        comptime field_count = struct_field_count[Self]()
-        comptime field_types = struct_field_types[Self]()
+        comptime r = reflect[Self]()
+        comptime field_count = r.field_count()
+        comptime field_types = r.field_types()
 
         comptime for idx in range(field_count):
             comptime field_type = field_types[idx]
@@ -211,9 +205,9 @@ trait MakeCopyable:
             comptime if not conforms_to(field_type, Copyable): continue
 
             # Perform the copy
-            ref p_value = __struct_field_ref(idx, self)
+            ref p_value = r.field_ref[idx](self)
             trait_downcast[Copyable & ImplicitlyDestructible](
-                __struct_field_ref(idx, other)
+                r.field_ref[idx](other)
             ) = trait_downcast[Copyable & ImplicitlyDestructible](
                 p_value
             ).copy()
@@ -229,9 +223,9 @@ trait MakeCopyable:
 - The `copy_to()` _implementation_ is heavily parameterized and evaluated at
   compile time. It uses `comptime for` and `comptime if` together with
   reflection calls.
-- The `__struct_field_ref(idx, self)` and `__struct_field_ref(idx, other)` calls
-  return references to fields by index, which allows both reading from the
-  source instance and writing to the destination instance.
+- The `r.field_ref[idx](self)` and `r.field_ref[idx](other)` calls return
+  references to fields by index, which allows both reading from the source
+  instance and writing to the destination instance.
 
 ### Create a struct
 
@@ -281,11 +275,10 @@ retrieves field value references from the `lhs` and `rhs` arguments. It uses
 early return for the first inequality (`False`), otherwise returning `True`:
 
 ```mojo
-from std.reflection import struct_field_count, struct_field_types
-
 def test_equality[T: AnyType](lhs: T, rhs: T) -> Bool:
-    comptime field_count = struct_field_count[T]()
-    comptime field_types = struct_field_types[T]()
+    comptime r = reflect[T]()
+    comptime field_count = r.field_count()
+    comptime field_types = r.field_types()
 
     comptime for idx in range(field_count):
         # Guard: field type must be equatable
@@ -293,8 +286,8 @@ def test_equality[T: AnyType](lhs: T, rhs: T) -> Bool:
         comptime if not conforms_to(field_type, Equatable): continue
 
         # Fetch values
-        ref lhs_value = __struct_field_ref(idx, lhs)
-        ref rhs_value = __struct_field_ref(idx, rhs)
+        ref lhs_value = r.field_ref[idx](lhs)
+        ref rhs_value = r.field_ref[idx](rhs)
 
         # Early exit with `False` when inequality found
         if trait_downcast[Equatable](lhs_value) != trait_downcast[Equatable](rhs_value): return False
@@ -313,8 +306,8 @@ def test_equality[T: AnyType](lhs: T, rhs: T) -> Bool:
   If its type, after resolution, does _not_ conform to that trait, it
   will produce a compilation error. Checking for conformance first
   ensures that error won't occur.
-- As its name suggests, `__struct_field_ref()` is limited to use with
-  struct types.
+- As its name suggests, `Reflected[T].field_ref[]()` is limited to use
+  with struct types.
 
 ### Calling the tests
 

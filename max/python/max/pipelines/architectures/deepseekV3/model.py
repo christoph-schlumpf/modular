@@ -26,7 +26,10 @@ from max.engine import InferenceSession, Model
 from max.graph import DeviceRef, Graph, ops
 from max.graph.weights import WeightData
 from max.nn.comm.ep import EPCommInitializer, EPConfig
-from max.nn.comm.ep.ep_config import estimate_ep_memory_usage
+from max.nn.comm.ep.ep_config import (
+    calculate_ep_max_tokens_per_rank,
+    estimate_ep_memory_usage,
+)
 from max.nn.kv_cache import KVCacheInputs, KVCacheParamInterface
 from max.pipelines.core import TextContext
 from max.pipelines.lib import (
@@ -175,23 +178,20 @@ class DeepseekV3Model(AlwaysSignalBuffersMixin, DeepseekV2Model):
                     "If you are running with expert parallelism, ep_size must"
                     " be set to the total number of GPUs across nodes."
                 )
-            n_nodes = ep_size // len(self.devices)
-
-            # With a mixed TP-attention + EP-MoE strategy, the attention output
-            # will be scattered across ranks, so each rank will only send a
-            # subset of the tokens.
-            attn_tp_size = ep_size // data_parallel_degree
-
             # TODO: Support TP attention for FP8 Deepseek-V3 models.
             if quant_config is not None and not quant_config.is_nvfp4:
-                if attn_tp_size > 1:
+                if ep_size > data_parallel_degree:
                     raise ValueError(
                         "TP attention is not supported for FP8 Deepseek-V3 models."
                     )
 
-            ep_max_rank_send_tokens = (
-                self.pipeline_config.runtime.max_batch_input_tokens
-                // attn_tp_size
+            n_nodes = ep_size // len(self.devices)
+
+            ep_max_rank_send_tokens = calculate_ep_max_tokens_per_rank(
+                max_batch_input_tokens=self.pipeline_config.runtime.max_batch_input_tokens,
+                ep_size=ep_size,
+                data_parallel_degree=data_parallel_degree,
+                use_allreduce=self.pipeline_config.runtime.ep_use_allreduce,
             )
 
             ep_kwargs: dict[str, Any] = dict(
@@ -204,6 +204,7 @@ class DeepseekV3Model(AlwaysSignalBuffersMixin, DeepseekV2Model):
                 n_gpus_per_node=len(self.devices),
                 n_nodes=n_nodes,
                 dispatch_quant_config=None,
+                use_allreduce=self.pipeline_config.runtime.ep_use_allreduce,
             )
 
             if config.n_shared_experts == 1:
@@ -412,15 +413,11 @@ class DeepseekV3Model(AlwaysSignalBuffersMixin, DeepseekV2Model):
         if pipeline_config.runtime.ep_size > 1:
             n_gpus_per_node = len(pipeline_config.model.device_specs)
 
-            # With a mixed TP-attention + EP-MoE strategy, the attention output
-            # will be scattered across ranks, so each rank will only send a
-            # subset of the tokens.
-            attn_tp_size = (
-                pipeline_config.runtime.ep_size
-                // pipeline_config.model.data_parallel_degree
-            )
-            ep_max_rank_send_tokens = (
-                pipeline_config.runtime.max_batch_input_tokens // attn_tp_size
+            ep_max_rank_send_tokens = calculate_ep_max_tokens_per_rank(
+                max_batch_input_tokens=pipeline_config.runtime.max_batch_input_tokens,
+                ep_size=pipeline_config.runtime.ep_size,
+                data_parallel_degree=pipeline_config.model.data_parallel_degree,
+                use_allreduce=pipeline_config.runtime.ep_use_allreduce,
             )
 
             # Calculate the maximum number of tokens a rank may receive during
@@ -431,6 +428,15 @@ class DeepseekV3Model(AlwaysSignalBuffersMixin, DeepseekV2Model):
                 pipeline_config.runtime.ep_size
                 * huggingface_config.num_experts_per_tok,
             )
+
+            if pipeline_config.runtime.ep_use_allreduce:
+                max_recv_tokens_per_rank = (
+                    pipeline_config.runtime.max_batch_input_tokens
+                    * min(
+                        huggingface_config.n_routed_experts // n_gpus_per_node,
+                        huggingface_config.num_experts_per_tok,
+                    )
+                )
 
             # The maximal activation memory usage happens at the second
             # grouped_matmul in the MoE layer. The input for that matmul would
@@ -472,6 +478,7 @@ class DeepseekV3Model(AlwaysSignalBuffersMixin, DeepseekV2Model):
                 n_nodes=n_nodes,
                 n_gpus_per_node=n_gpus_per_node,
                 top_k=huggingface_config.num_experts_per_tok,
+                use_allreduce=pipeline_config.runtime.ep_use_allreduce,
             )
             ep_buffer_memory = per_device_ep_memory * n_gpus_per_node
 

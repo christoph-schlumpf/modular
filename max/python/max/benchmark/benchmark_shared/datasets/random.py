@@ -81,7 +81,6 @@ class RandomBenchmarkDataset(LocalBenchmarkDataset):
         max_num_unique_sys_prompt: int,
         min_input_len: int = 4,
         min_output_len: int = 1,
-        randomize_starting_turn: bool = False,
     ) -> ChatSamples:
         """Generate multiturn random chat requests.
 
@@ -236,15 +235,7 @@ class RandomBenchmarkDataset(LocalBenchmarkDataset):
 
             follow_up_turn_idx_offset += num_turns_per_session[session_id] - 1
 
-            total_turns = len(messages) // 2
-            prefix_turns = (
-                random.randint(0, total_turns - 1)
-                if randomize_starting_turn and total_turns > 1
-                else 0
-            )
-            sessions.append(
-                ChatSession(session_id, messages, prefix_turns=prefix_turns)
-            )
+            sessions.append(ChatSession(session_id, messages))
 
         return ChatSamples(
             chat_sessions=sessions,
@@ -306,7 +297,7 @@ class RandomBenchmarkDataset(LocalBenchmarkDataset):
             if len(tokenized_prompts) == required_prompts:
                 break
 
-            token_ids = tokenizer(prompt).input_ids
+            token_ids = tokenizer.encode(prompt)
             if len(token_ids) < 4:
                 # Prune too short sequences.
                 continue
@@ -549,7 +540,7 @@ class RandomBenchmarkDataset(LocalBenchmarkDataset):
                 ]
                 sys_prompt = tokenizer.decode(sys_prompt_ids)
                 sys_prompt_len = len(
-                    tokenizer(sys_prompt, add_special_tokens=False).input_ids
+                    tokenizer.encode(sys_prompt, add_special_tokens=False)
                 )
                 prev = warmup_dict.get(sys_prompt_idx)
                 if sys_prompt_len > 0 and (
@@ -577,7 +568,7 @@ class RandomBenchmarkDataset(LocalBenchmarkDataset):
             # int(input_lens[i]) that we randomly generated since multiple
             # input tokens may be bundled together in one pass
             input_len_actual = (
-                len(tokenizer(prompt, add_special_tokens=False).input_ids)
+                len(tokenizer.encode(prompt, add_special_tokens=False))
                 + image_token_len
             )
             input_requests.append(

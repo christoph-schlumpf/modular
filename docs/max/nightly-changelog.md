@@ -22,6 +22,8 @@ This version is still a work in progress.
   `guidance_scale > 1.0` and a negative prompt were supplied. Wan now enables
   classical CFG whenever `guidance_scale > 1.0` and defaults an absent
   negative prompt to the empty string, matching the diffusers baseline.
+- Added `ModuleV3` version of Gemma3 and Gemma3multimodal, with multi-gpu
+  support.
 
 ## MAX framework {#26-3-max}
 
@@ -38,6 +40,9 @@ This version is still a work in progress.
 - Added `--model-override` CLI flag for per-component `ModelManifest` overrides
   (e.g. `--model-override transformer.quantization_encoding=float4_e2m1fnx2`),
   enabling mixed quantization in diffusion pipelines.
+- Removed jump forward decoding (`compute_ff_tokens`) from structured output.
+  The bitmask constraint alone ensures valid structured output, matching the
+  approach used by vLLM and SGLang.
 
 ### `max` CLI {#26-3-max-cli}
 
@@ -47,6 +52,12 @@ This version is still a work in progress.
 
 ### Python API {#26-3-max-python}
 
+- Added `Model.release_captured_graph()`, which drops a previously captured
+  device graph identified by graph key (or per-device keys) and frees its
+  device-side working memory once any in-flight replay completes. Releasing a
+  key that was never captured is a no-op. Callers remain responsible for
+  dropping any output `Buffer` handles returned by the corresponding
+  `Model.capture()` call.
 - Added `ops.roi_align` graph op and `F.roi_align` functional wrapper for
   ROI Align pooling over NHWC inputs with configurable spatial scale, sampling
   ratio, alignment mode, and AVG/MAX pooling.
@@ -61,6 +72,11 @@ This version is still a work in progress.
   eager-mode execution of group normalization without graph compilation.
 - Fixed tensor slicing with negative integer indices (e.g. `hidden[:, -1]`)
   which previously raised a `RuntimeError` at compile time.
+- Fixed `ops.reshape` / `TensorValue.reshape` rejecting valid `-1` reshapes
+  on tensors whose leading dim is a symbolic sum-of-products (e.g.
+  `[(batch_size * num_steps) + total_seq_len, 1536]` reshaped to
+  `[-1, n_heads, head_dim]` with `n_heads * head_dim == 1536`). The inferred
+  dim now simplifies without requiring a `rebind`.
 - Setting `MODULAR_MAX_DEBUG_UNINITIALIZED_READ_CHECK=true` (or the
   `max-debug.uninitialized-read-check` config key, or
   `InferenceSession.debug.uninitialized_read_check = True`) enables detection
@@ -252,10 +268,28 @@ This version is still a work in progress.
   than `self_attn.qkv_proj.q_proj.weight`. This lets HuggingFace
   checkpoint names flow into models without per-architecture remapping
   in their `weight_adapters.py`.
-
-- `Module.compile()` now accepts a `custom_extensions` parameter for loading
-  custom Mojo kernel libraries at graph construction time, fixing validation
-  failures for kernels with struct-level parameters.
+- `max.experimental.nn.Module.compile()` now accepts a `custom_extensions`
+  parameter for loading custom Mojo kernel libraries at graph construction
+  time, fixing validation failures for kernels with struct-level parameters.
+- `max.experimental.nn.Module.compile()` now returns a `CompiledModel` instead
+  of a bare closure, which exposes `__call__()` (Tensor-in/Tensor-out,
+  backward compatible), `execute_raw(*buffers)` (Buffer-in/Buffer-out, skips
+  Tensor wrapping overhead), and the `engine_model` property (the underlying
+  `engine.Model` for CUDA graph capture/replay).
+- `max.experimental.nn.Module.load_state_dict()` and `Module.compile()` now
+  auto-shard single-device tensors or buffers into distributed weights based
+  on each parameter's `DeviceMapping`, allowing unsharded checkpoints to be
+  loaded directly into multi-GPU models without manual pre-sharding.
+- `max.experimental.nn.Module.to()` and `max.experimental.Tensor.to()`
+  now accept `DeviceMapping` and `DeviceMesh` inputs, enabling concise placement
+  of an entire module onto a multi-GPU mesh.
+- Added distributed `ModuleV3` common layers
+  (`max.experimental.nn.common_layers`): `VocabParallelEmbedding`, tensor-
+  parallelism support in `Linear`, `MLP` and `RMSNorm`. Used to
+  enable multi-GPU Gemma3 in MAX.
+- Added documentation and a usage example for
+  `max.experimental.nn.RotaryEmbedding`, including a detailed explanation
+  of the RoPE mechanism.
 - Fixed `torch.compile(fullgraph=True)` failing with an "Unsupported context
   manager" error when accessing `CustomOpLibrary` ops inside the compiled
   function. Ops are now eagerly compiled during library initialization.
@@ -319,6 +353,14 @@ This version is still a work in progress.
   AMD GPUs when the high and low 32-bit halves of the fill value differ (e.g.,
   `2.0`), reducing the call count to O(log N).
   ([Issue #6417](https://github.com/modular/modular/issues/6417))
+
+- Fixed integer indexing into a graph tensor (e.g. `x[0]` on a `(2, 3)`
+  tensor) failing graph compilation with
+  `'mo.static.reshape' op input and output elements do not match`. A
+  reshape-through-slice optimization pattern was incorrectly rewriting
+  the slice + squeeze pattern produced by integer indexing, generating a
+  reshape whose element count did not match the input.
+  ([Issue #6440](https://github.com/modular/modular/issues/6440))
 
 ## Mojo language {#26-3-mojo}
 

@@ -38,12 +38,11 @@ from std.utils import Variant
 
 from std.builtin.device_passable import DevicePassable
 from std.builtin.rebind import downcast
-from std.compile import get_type_name
 from std.format._utils import FormatStruct, TypeNames, write_to, write_repr_to
 from std.hashlib import Hasher
 from std.memory import UnsafeMaybeUninit
 from std.memory.unsafe_pointer import unsafe_cast
-from std.reflection import call_location
+from std.reflection import call_location, reflect
 from std.sys.intrinsics import _type_is_eq
 from std.utils.variant import _all_trivial_copyinit
 from std.utils._nicheable import (
@@ -371,9 +370,7 @@ struct Optional[T: Movable](
         """
         if self:
             if rhs:
-                return trait_downcast[Equatable](
-                    self.unsafe_value()
-                ) == trait_downcast[Equatable](rhs.unsafe_value())
+                return self.unsafe_value() == rhs.unsafe_value()
             return False
         return not rhs
 
@@ -504,9 +501,9 @@ struct Optional[T: Movable](
     ](self: Self, mut writer: Some[Writer]) where conforms_to(Self.T, Writable):
         if self:
             comptime if is_repr:
-                trait_downcast[Writable](self.value()).write_repr_to(writer)
+                self.value().write_repr_to(writer)
             else:
-                trait_downcast[Writable](self.value()).write_to(writer)
+                self.value().write_to(writer)
         else:
             writer.write_string("None")
 
@@ -553,7 +550,7 @@ struct Optional[T: Movable](
         if self:
             # Tag the hash so that hash(T) != hash(Optional[T](..)).
             hasher.update(UInt8(1))
-            trait_downcast[Hashable](self.value()).__hash__(hasher)
+            self.value().__hash__(hasher)
         else:
             hasher.update(UInt8(0))
 
@@ -580,7 +577,7 @@ struct Optional[T: Movable](
         Returns:
             A string representation of the type, e.g. `Optional[Int]`.
         """
-        return String(t"Optional[{get_type_name[Self.T]()}]")
+        return String(t"Optional[{reflect[Self.T]().name()}]")
 
     # ===-------------------------------------------------------------------===#
     # Methods
@@ -1037,7 +1034,7 @@ struct OptionalReg[T: TrivialRegisterPassable](
         Returns:
             A string representation of the type, e.g. `OptionalReg[Int]`.
         """
-        return String(t"OptionalReg[{get_type_name[Self.T]()}]")
+        return String(t"OptionalReg[{reflect[Self.T]().name()}]")
 
     # ===-------------------------------------------------------------------===#
     # Life cycle methods

@@ -37,6 +37,10 @@ from max.interfaces import (
 from max.pipelines.core import TextAndVisionContext, TextContext, TTSContext
 from max.pipelines.lib import reasoning
 from max.profiler import Tracer
+from max.serve.pipelines.incremental_detokenizer import (
+    IncrementalDetokenizer,
+    create_incremental_detokenizer,
+)
 from max.serve.telemetry.metrics import METRICS
 from max.serve.telemetry.stopwatch import StopWatch, record_ms
 from max.serve.worker_interface import ModelWorkerProxy
@@ -68,6 +72,7 @@ class TokenGeneratorOutput:
     token_log_probabilities: list[float] | None = None
     top_log_probabilities: list[dict[str, float]] | None = None
     prompt_token_count: int | None = None
+    cached_token_count: int | None = None
     reasoning_token_count: int | None = None
     stop_sequence: str | None = None
 
@@ -178,6 +183,27 @@ class TokenGeneratorPipeline(
 
             METRICS.input_tokens(context.tokens.prompt_length)
 
+            # Create incremental detokenizers for proper UTF-8 handling.
+            # These handle multi-byte UTF-8 sequences that span multiple tokens,
+            # such as emojis like 🫆 which require 4 bytes and may be split
+            # across multiple tokens. Without incremental detokenization, each
+            # token decoded separately would produce replacement characters (�).
+            # See SERVSYS-1032 for details.
+            content_detokenizer: IncrementalDetokenizer | None = (
+                create_incremental_detokenizer(
+                    self.tokenizer,
+                    context.tokens.prompt,
+                    skip_special_tokens=skip_special_tokens,
+                )
+            )
+            reasoning_detokenizer: IncrementalDetokenizer | None = (
+                create_incremental_detokenizer(
+                    self.tokenizer,
+                    context.tokens.prompt,
+                    skip_special_tokens=skip_special_tokens,
+                )
+            )
+
             if is_still_reasoning:
                 # Check if reasoning was disabled in the prompt
                 assert reasoning_parser is not None
@@ -243,25 +269,34 @@ class TokenGeneratorPipeline(
                     with Tracer(
                         f"tokenizer.decode_chunk({token_count + reasoning_token_count} toks)"
                     ):
-                        decoded_tokens = (
-                            None
-                            if tokens is None
-                            else await self.tokenizer.decode(
+                        # Use incremental detokenizer if available for proper
+                        # UTF-8 handling, otherwise fall back to direct decode.
+                        if tokens is None:
+                            decoded_tokens = None
+                        elif content_detokenizer is not None:
+                            decoded_tokens = content_detokenizer.decode(tokens)
+                        else:
+                            decoded_tokens = await self.tokenizer.decode(
                                 np.array(tokens),
                                 skip_special_tokens=skip_special_tokens,
                             )
-                        )
 
-                        decoded_reasoning_tokens = (
-                            None
-                            if reasoning_tokens is None
-                            else await self.tokenizer.decode(
-                                np.array(reasoning_tokens),
-                                skip_special_tokens=skip_special_tokens,
+                        if reasoning_tokens is None:
+                            decoded_reasoning_tokens = None
+                        elif reasoning_detokenizer is not None:
+                            decoded_reasoning_tokens = (
+                                reasoning_detokenizer.decode(reasoning_tokens)
                             )
-                        )
+                        else:
+                            decoded_reasoning_tokens = (
+                                await self.tokenizer.decode(
+                                    np.array(reasoning_tokens),
+                                    skip_special_tokens=skip_special_tokens,
+                                )
+                            )
 
                     # Check for stop sequences if configured (EOSTracker)
+                    status = response.final_status
                     stop_sequence_match = None
                     if has_stop_sequences and decoded_tokens is not None:
                         with Tracer("eos_tracker.is_eos_from_string"):
@@ -271,6 +306,7 @@ class TokenGeneratorPipeline(
                                     decoded_tokens
                                 )
                             ):
+                                status = GenerationStatus.END_OF_SEQUENCE
                                 self.model_worker.cancel(request.request_id)
 
                     # Collect log probability values if present (still per-token)
@@ -292,7 +328,8 @@ class TokenGeneratorPipeline(
                                 top_token_log_prob_values.extend(top_probs)
 
                     # Record metrics - one TTFT/ITL per chunk
-                    if not first_chunk_yielded:
+                    is_first_chunk = not first_chunk_yielded
+                    if is_first_chunk:
                         METRICS.ttft(itl.elapsed_ms)
                         first_chunk_yielded = True
                     else:
@@ -300,13 +337,16 @@ class TokenGeneratorPipeline(
                     itl.reset()
 
                     yield TokenGeneratorOutput(
-                        status=response.final_status,
+                        status=status,
                         decoded_tokens=decoded_tokens,
                         decoded_reasoning_tokens=decoded_reasoning_tokens,
                         token_count=token_count,
                         token_log_probabilities=token_log_prob_values,
                         top_log_probabilities=top_token_log_prob_values,
                         prompt_token_count=context.tokens.prompt_length,
+                        cached_token_count=response.num_cached_tokens
+                        if is_first_chunk
+                        else None,
                         reasoning_token_count=reasoning_token_count,
                         stop_sequence=stop_sequence_match,
                     )

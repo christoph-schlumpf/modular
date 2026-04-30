@@ -20,7 +20,7 @@ low-level memory operations, interfacing with C code, and building custom data
 structures.
 """
 
-from std.sys import align_of, is_gpu, is_nvidia_gpu, size_of
+from std.sys import align_of, is_apple_gpu, is_gpu, is_nvidia_gpu, size_of
 from std.sys.intrinsics import (
     gather,
     scatter,
@@ -34,8 +34,8 @@ from std.builtin.rebind import downcast
 from std.builtin.format_int import _write_int
 from std.builtin.simd import _simd_construction_checks
 from std.collections import OptionalReg
-from std.compile import get_type_name
 from std.format._utils import FormatStruct, Named, TypeNames
+from std.reflection import reflect
 from std.memory import memcpy
 from std.memory.memory import _free, _malloc
 from std.memory import UnsafeMaybeUninit
@@ -230,7 +230,7 @@ def alloc[
     ```
     """
     comptime size_of_t = size_of[type]()
-    comptime type_name = get_type_name[type]()
+    comptime type_name = reflect[type]().name()
     comptime assert size_of_t > 0, "size must be greater than zero"
     debug_assert(
         count >= 0,
@@ -452,11 +452,13 @@ struct UnsafePointer[
     is no overhead compared to a raw pointer.
 
     ```mojo
+    from std.random import random_float64
+
     # A field that may or may not point to a heap-allocated Int.
     var maybe_ptr: Optional[UnsafePointer[Int, MutExternalOrigin]] = None
 
     # Maybe populate it later.
-    if some_condition():
+    if random_float64() > 0.5:
         maybe_ptr = alloc[Int](1)
 
     # Check for absence, then unwrap to use the pointer.
@@ -1106,7 +1108,7 @@ struct UnsafePointer[
         """
         return String(
             "UnsafePointer[",
-            get_type_name[Self.type](),
+            reflect[Self.type]().name(),
             ", mut=",
             Self.mut,
             ", address_space=",
@@ -1657,6 +1659,15 @@ struct UnsafePointer[
             alignment.is_power_of_two()
         ), "alignment must be a power of two integer value"
 
+        comptime if is_apple_gpu():
+            # `Int(self)` would erase the address space; on Apple AIR the
+            # resulting GENERIC load silently reads zero (MOCO-3762).
+            var result = default
+            comptime for i in range(width):
+                if mask[i]:
+                    result[i] = self.load[alignment=alignment](Int(offset[i]))
+            return result
+
         var base = offset.cast[DType.int]().fma(
             SIMD[DType.int, width](size_of[dtype]()),
             SIMD[DType.int, width](Int(self)),
@@ -1712,6 +1723,13 @@ struct UnsafePointer[
         comptime assert (
             alignment.is_power_of_two()
         ), "alignment must be a power of two integer value"
+
+        comptime if is_apple_gpu():
+            # See `gather` for the address-space rationale (MOCO-3762).
+            comptime for i in range(width):
+                if mask[i]:
+                    self.store[alignment=alignment](Int(offset[i]), val[i])
+            return
 
         var base = offset.cast[DType.int]().fma(
             SIMD[DType.int, width](size_of[dtype]()),

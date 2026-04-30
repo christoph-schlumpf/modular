@@ -102,6 +102,11 @@ class ChatSession:
     messages: Sequence[ChatMessage]
     prefix_turns: int = 0
 
+    @property
+    def num_turns(self) -> int:
+        """Number of turns in the session (one (user, assistant) pair = one turn)."""
+        return len(self.messages) // 2
+
 
 @dataclass
 class RequestSamples:
@@ -119,7 +124,7 @@ Samples = RequestSamples | ChatSamples
 
 
 def estimate_num_tokens(tokenizer: PreTrainedTokenizerBase, text: str) -> int:
-    return len(tokenizer(text, add_special_tokens=False).input_ids)
+    return len(tokenizer.encode(text, add_special_tokens=False))
 
 
 def build_chat_message(
