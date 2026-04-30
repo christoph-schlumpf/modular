@@ -270,9 +270,9 @@ def foo(arg0: Some[Writable], arg1: type_of(arg0)): ...  # 🔴 Avoid
 def foo[Str: Writable, //](arg0: Str, arg1: Str): ...    # 🟢 Preferred
 ```
 
-#### Use the `*SomeTypeList[]` utility instead of named type lists
+#### Use the `SomeTypeList[]` utility instead of named type lists
 
-Consider using `*SomeTypeList[]` if a named type list is not reused in a
+Consider using `SomeTypeList[]` if a named type list is not reused in a
 function signature or body.
 
 ```mojo
